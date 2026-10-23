@@ -157,6 +157,13 @@ impl Api {
         self.req("PATCH", &format!("{}/{task}", tasks_url(list)), Some(patch)).map(drop)
     }
 
+    /// Google keeps the task id and moves its subtasks along.
+    pub fn move_task(&mut self, list: &str, task: &str, dest: &str) -> Result<(), ApiError> {
+        let mut u = url::Url::parse(&format!("{}/{task}/move", tasks_url(list))).expect("valid url");
+        u.query_pairs_mut().append_pair("destinationTasklist", dest);
+        self.req("POST", u.as_str(), None).map(drop)
+    }
+
     pub fn delete_task(&mut self, list: &str, task: &str) -> Result<(), ApiError> {
         self.req("DELETE", &format!("{}/{task}", tasks_url(list)), None).map(drop)
     }

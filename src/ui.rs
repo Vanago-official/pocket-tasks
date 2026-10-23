@@ -1,4 +1,4 @@
-use crate::app::{App, Click, Drop, InputKind, Mode, TileRow};
+use crate::app::{App, Click, DragItem, Drop, InputKind, Mode, TileRow};
 use crate::date;
 use crate::model::Task;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -139,6 +139,7 @@ fn panel_rect(area: Rect, pocket: bool) -> Rect {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.task_drop = app.drag.as_ref().filter(|d| d.moved).and_then(|d| app.task_drop_list(d.pos));
     app.hits.clear();
     app.tile_rects.clear();
     app.col_rects.clear();
@@ -179,6 +180,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_confirm(f, app, &msg)
         }
         Mode::Help => draw_help(f),
+        Mode::MoveTo { list, task, sel } => {
+            let (list, task, sel) = (list.clone(), task.clone(), *sel);
+            draw_move(f, app, &list, &task, sel)
+        }
         Mode::Normal => {}
     }
 }
@@ -321,9 +326,12 @@ fn draw_column(f: &mut Frame, app: &mut App, c: usize, ids: &[String], area: Rec
 fn draw_tile(f: &mut Frame, app: &mut App, id: &str, r: Rect) {
     let Some(list) = app.list(id).cloned() else { return };
     let selected = app.sel.list == id;
-    let dragging = app.drag.as_ref().is_some_and(|d| d.moved && d.list == id);
+    let dragging = app.drag.as_ref().is_some_and(|d| d.moved && d.item == DragItem::Tile(id.to_string()));
+    let task_target = app.task_drop.as_deref() == Some(id);
     let tile_hover = hovered(app, r);
-    let border = if dragging {
+    let border = if task_target {
+        ACCENT
+    } else if dragging {
         SURFACE0
     } else if selected {
         ACCENT
@@ -334,7 +342,7 @@ fn draw_tile(f: &mut Frame, app: &mut App, id: &str, r: Rect) {
     };
     f.render_widget(
         Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(if task_target { BorderType::Thick } else { BorderType::Rounded })
             .border_style(Style::new().fg(border))
             .style(Style::new().bg(BASE).fg(TEXT)),
         r,
@@ -449,6 +457,7 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
         right.buttons(vec![
             ("+", Click::AddSubtask(l.clone(), id.clone())),
             ("◷", Click::EditDue(l.clone(), id.clone())),
+            ("⇄", Click::MoveTask(l.clone(), id.clone())),
             ("✎", Click::EditTitle(l.clone(), id.clone())),
             ("✕", Click::DeleteTask(l, id)),
         ]);
@@ -473,7 +482,24 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
 /// Drop indicator and a ghost label following the cursor while a tile is dragged.
 fn draw_drag(f: &mut Frame, app: &mut App) {
     let Some(d) = app.drag.as_ref().filter(|d| d.moved) else { return };
-    let (pos, title) = (d.pos, app.list(&d.list).map(|l| l.title.clone()).unwrap_or_default());
+    let pos = d.pos;
+    let title = match &d.item {
+        DragItem::Tile(list) => app.list(list).map(|l| l.title.clone()).unwrap_or_default(),
+        DragItem::Task { list, task } => {
+            // Moving a task: the target tile is highlighted while drawing; only the ghost here.
+            let name = app.list_tasks(list).iter().find(|t| t.id == *task).map(|t| t.title.clone());
+            let to = match &app.task_drop {
+                Some(dest) => format!(" → {}", app.list(dest).map(|l| l.title.as_str()).unwrap_or("")),
+                None => " → перетягніть на інший список".into(),
+            };
+            let label = format!(" ⠿ {}{to} ", truncate(&name.unwrap_or_default(), 30));
+            let area = f.area();
+            let w = (label.chars().count() as u16).min(area.width);
+            let x = (pos.x + 1).min(area.right().saturating_sub(w));
+            f.render_widget(Span::styled(label, BTN_HOVER.bold()), Rect::new(x, pos.y, w, 1));
+            return;
+        }
+    };
     let line = Style::new().fg(ACCENT).bold();
     let rect_of = |id: &str| app.tile_rects.iter().find(|(t, _)| t == id).map(|(_, r)| *r);
     match app.drop_target(pos) {
@@ -528,6 +554,7 @@ fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
             (if t.done() { "↺ Відновити" } else { "✔ Готово" }, Click::ToggleDone(l.clone(), id.clone())),
             ("◷ Дедлайн", Click::EditDue(l.clone(), id.clone())),
             ("≡ Опис", Click::EditNotes(l.clone(), id.clone())),
+            ("⇄ В інший список", Click::MoveTask(l.clone(), id.clone())),
         ]);
         lines.push(Line::raw(t.title.clone()).bold());
         if let Some(d) = t.due_date() {
@@ -703,6 +730,36 @@ fn draw_confirm(f: &mut Frame, app: &mut App, msg: &str) {
     place(f, app, bx, r.bottom().saturating_sub(2), btns.w, btns);
 }
 
+fn draw_move(f: &mut Frame, app: &mut App, list: &str, task: &str, sel: usize) {
+    let targets = app.move_targets(list);
+    let name = app.list_tasks(list).iter().find(|t| t.id == task).map(|t| t.title.clone()).unwrap_or_default();
+    let r = popup(app.panel, 50, targets.len() as u16 + 3);
+    surface(f, r, BASE);
+    f.render_widget(block(format!(" Перенести «{}» ", truncate(&name, 30)), true), r);
+    let w = r.width.saturating_sub(2);
+    for (i, id) in targets.iter().enumerate() {
+        let y = r.y + 1 + i as u16;
+        if y >= r.bottom() - 2 {
+            break;
+        }
+        let row = Rect::new(r.x + 1, y, w, 1);
+        let active = i == sel || hovered(app, row);
+        if active {
+            f.render_widget(Block::new().bg(SELECTED_BG), row);
+        }
+        let title = app.list(id).map(|l| l.title.clone()).unwrap_or_default();
+        let mut s = Seg::default();
+        s.text(format!(" {} ", if i < 9 { (i + 1).to_string() } else { " ".into() }), Style::new().fg(ACCENT).bold());
+        s.text(truncate(&title, w as usize - 8), if active { Style::new().fg(ACCENT).bold() } else { Style::new() });
+        s.text(format!(" {}", app.open_count(id)), DIM);
+        app.hits.push((row, Click::MoveTo(id.clone())));
+        place(f, app, row.x, y, w, s);
+    }
+    let mut btns = Seg::default();
+    btns.button("Скасувати", Click::Cancel);
+    place(f, app, r.right().saturating_sub(btns.w + 2), r.bottom() - 1, btns.w, btns);
+}
+
 fn draw_help(f: &mut Frame) {
     const KEYS: &[(&str, &str)] = &[
         ("Мишею", "кнопки, ○ — виконати, ▾ — згорнути"),
@@ -720,6 +777,8 @@ fn draw_help(f: &mut Frame) {
         ("N", "новий список"),
         ("Space", "виконано / не виконано"),
         ("e  i  d", "назва · опис · дедлайн"),
+        ("m  ⇄", "перенести в інший список (або тягніть"),
+        ("", "завдання мишею на іншу плитку)"),
         ("x  Del", "видалити"),
         ("c / C", "показати виконані / видалити їх"),
         ("r", "синхронізувати зараз"),
@@ -740,7 +799,7 @@ fn draw_help(f: &mut Frame) {
 mod tests {
     use super::*;
     use crate::app::Sel;
-    use crate::model::{State, TaskList};
+    use crate::model::{Op, State, TaskList};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -885,6 +944,61 @@ mod tests {
         drag(&mut app, "c", Rect::new(r.x + 20, r.y, 1, 1));
         assert_eq!(app.st.layout, before);
         assert_eq!(app.sel, Sel { list: "c".into(), row: 0 });
+    }
+
+    #[test]
+    fn move_tasks_between_lists() {
+        let mut app = sample();
+        render(&mut app);
+        // Drag "Купити молоко" (with its subtask) onto the "Покупки" tile.
+        let row = hit(&app, Click::Select("a".into(), 1));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 6, row.y, 1, 1));
+        let c = tile(&app, "c");
+        let to = Rect::new(c.x + c.width / 2, c.y + 1, 1, 1);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to);
+        let screen = render(&mut app);
+        println!("{screen}");
+        assert_eq!(app.task_drop.as_deref(), Some("c"));
+        assert!(screen.contains("→ Покупки"));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), to);
+        let ids = |app: &App, l: &str| app.list_tasks(l).iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app, "a"), ["3"]);
+        assert_eq!(ids(&app, "c"), ["5", "1", "2"]);
+        assert_eq!(app.list_tasks("c")[2].parent.as_deref(), Some("1"));
+        assert!(matches!(&app.st.pending[0], Op::MoveTask { list, task, dest } if list == "a" && task == "1" && dest == "c"));
+        assert_eq!(app.selected_task().map(|t| t.id.as_str()), Some("1"));
+
+        // Dropping back on its own tile does nothing.
+        render(&mut app);
+        let row = hit(&app, Click::Select("c".into(), 1));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 6, row.y, 1, 1));
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), Rect::new(row.x + 8, row.y + 1, 1, 1));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), Rect::new(row.x + 8, row.y + 1, 1, 1));
+        assert_eq!(app.st.pending.len(), 1);
+
+        // Subtask via keyboard picker: becomes a top-level task in "Робота".
+        app.sel = Sel { list: "c".into(), row: 0 };
+        app.select_task_pub("c", "2");
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('m'), KeyModifiers::NONE));
+        let screen = render(&mut app);
+        println!("{screen}");
+        assert!(matches!(app.mode, Mode::MoveTo { .. }));
+        // Targets in board order without "Покупки": Мої завдання, Робота.
+        let robota = app.hits[app.modal_from..].iter().find(|(_, c)| *c == Click::MoveTo("b".into())).unwrap().0;
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), robota);
+        let moved = app.list_tasks("b").iter().find(|t| t.id == "2").unwrap();
+        assert_eq!(moved.parent, None);
+        assert!(app.list_tasks("c").iter().all(|t| t.id != "2"));
+
+        // "Робота" is collapsed, so the selection falls back to its header.
+        assert_eq!(app.sel, Sel { list: "b".into(), row: 0 });
+
+        // Keyboard: m then 1 sends it to the first other list.
+        app.st.collapsed.clear();
+        assert!(app.select_task_pub("b", "2"));
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('m'), KeyModifiers::NONE));
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(app.list_tasks("a").iter().any(|t| t.id == "2"));
     }
 
     #[test]

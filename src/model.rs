@@ -53,6 +53,8 @@ pub enum Op {
     CreateTask { list: String, tmp: String, parent: Option<String>, title: String },
     PatchTask { list: String, task: String, patch: Value },
     DeleteTask { list: String, task: String },
+    /// Move a task (with its subtasks) to another list.
+    MoveTask { list: String, task: String, dest: String },
 }
 
 impl Op {
@@ -76,6 +78,11 @@ impl Op {
             Op::PatchTask { list, task, .. } | Op::DeleteTask { list, task } => {
                 fix(list);
                 fix(task);
+            }
+            Op::MoveTask { list, task, dest } => {
+                fix(list);
+                fix(task);
+                fix(dest);
             }
         }
     }

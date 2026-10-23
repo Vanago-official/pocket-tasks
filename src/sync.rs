@@ -39,6 +39,7 @@ fn exec(api: &mut Api, op: &Op) -> Result<Option<Created>, ApiError> {
         }
         Op::PatchTask { list, task, patch } => api.patch_task(list, task, patch).map(|_| None),
         Op::DeleteTask { list, task } => gone(api.delete_task(list, task)),
+        Op::MoveTask { list, task, dest } => api.move_task(list, task, dest).map(|_| None),
     }
 }
 

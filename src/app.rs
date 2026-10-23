@@ -42,8 +42,15 @@ pub enum Drop {
     ColumnEnd(usize),
 }
 
+/// What is being dragged: a whole tile, or one task on its way to another list.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DragItem {
+    Tile(String),
+    Task { list: String, task: String },
+}
+
 pub struct Drag {
-    pub list: String,
+    pub item: DragItem,
     pub from: Position,
     pub pos: Position,
     pub moved: bool,
@@ -63,6 +70,10 @@ pub enum Click {
     EditNotes(String, String),
     EditDue(String, String),
     DeleteTask(String, String),
+    /// Open the "move to list" picker for a task.
+    MoveTask(String, String),
+    /// Pick a destination list in that picker.
+    MoveTo(String),
     DeleteCompleted(String),
     AddList,
     RenameList(String),
@@ -107,6 +118,8 @@ pub enum Mode {
     Normal,
     Input { kind: InputKind, ed: Editor },
     Confirm { what: Confirm, msg: String },
+    /// Choosing the destination list for a task; `sel` indexes `move_targets()`.
+    MoveTo { list: String, task: String, sel: usize },
     Help,
 }
 
@@ -224,6 +237,8 @@ pub struct App {
     pub modal_from: usize,
     pub hover: Option<Position>,
     pub drag: Option<Drag>,
+    /// Tile a dragged task would land in, worked out from the previous frame.
+    pub task_drop: Option<String>,
     pub busy: bool,
     pub net_error: Option<String>,
     pub auth_error: Option<String>,
@@ -258,6 +273,7 @@ impl App {
             modal_from: 0,
             hover: None,
             drag: None,
+            task_drop: None,
             busy: false,
             net_error: None,
             auth_error: None,
@@ -301,24 +317,29 @@ impl App {
         self.st.collapsed.contains(list)
     }
 
-    /// Tasks of one list as (index into its vec, depth): open tasks by position with
-    /// their subtasks, then completed ones (newest first).
+    /// Tasks of one list as (index into its vec, depth): open tasks with their subtasks,
+    /// nearest deadline first (undated ones after, in Google's order), then completed
+    /// ones (newest first).
     pub fn task_rows(&self, list: &str) -> Vec<(usize, u8)> {
         let tasks = self.list_tasks(list);
         let ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         let show_done = self.st.show_completed;
+        let by_due = |&a: &usize, &b: &usize| {
+            let key = |i: usize| (tasks[i].due_date().is_none(), tasks[i].due_date(), &tasks[i].position);
+            key(a).cmp(&key(b))
+        };
         let children = |pid: &str| {
             let mut c: Vec<usize> = (0..tasks.len())
                 .filter(|&i| tasks[i].parent.as_deref() == Some(pid) && (show_done || !tasks[i].done()))
                 .collect();
-            c.sort_by(|&a, &b| (tasks[a].done(), &tasks[a].position).cmp(&(tasks[b].done(), &tasks[b].position)));
+            c.sort_by(|a, b| tasks[*a].done().cmp(&tasks[*b].done()).then_with(|| by_due(a, b)));
             c
         };
         let top: Vec<usize> = (0..tasks.len())
             .filter(|&i| tasks[i].parent.as_deref().is_none_or(|p| !ids.contains(p)))
             .collect();
         let mut open: Vec<usize> = top.iter().copied().filter(|&i| !tasks[i].done()).collect();
-        open.sort_by(|&a, &b| tasks[a].position.cmp(&tasks[b].position));
+        open.sort_by(by_due);
         let mut done: Vec<usize> =
             if show_done { top.iter().copied().filter(|&i| tasks[i].done()).collect() } else { vec![] };
         done.sort_by(|&a, &b| tasks[b].completed.cmp(&tasks[a].completed));
@@ -429,6 +450,11 @@ impl App {
         self.clamp();
     }
 
+    #[cfg(test)]
+    pub fn select_task_pub(&mut self, list: &str, id: &str) -> bool {
+        self.select_task(list, id)
+    }
+
     fn select_task(&mut self, list: &str, id: &str) -> bool {
         let tasks = self.list_tasks(list);
         let row = self
@@ -523,7 +549,7 @@ impl App {
 
     /// Where a tile dragged to `pos` would land, based on the last frame's geometry.
     pub fn drop_target(&self, pos: Position) -> Option<Drop> {
-        let dragged = &self.drag.as_ref()?.list;
+        let Some(DragItem::Tile(dragged)) = self.drag.as_ref().map(|d| &d.item) else { return None };
         if let Some((id, r)) = self.tile_rects.iter().find(|(_, r)| r.contains(pos)) {
             if id == dragged {
                 return None;
@@ -541,6 +567,52 @@ impl App {
             });
         }
         self.col_rects.iter().find(|(_, r)| r.contains(pos)).map(|(c, _)| Drop::ColumnEnd(*c))
+    }
+
+    /// The tile a dragged task would move into (any list other than its own).
+    pub fn task_drop_list(&self, pos: Position) -> Option<String> {
+        let Some(DragItem::Task { list, .. }) = self.drag.as_ref().map(|d| &d.item) else { return None };
+        self.tile_rects.iter().find(|(id, r)| r.contains(pos) && id != list).map(|(id, _)| id.clone())
+    }
+
+    /// Lists a task can move to, in board order.
+    pub fn move_targets(&self, from: &str) -> Vec<String> {
+        self.st.layout.concat().into_iter().filter(|id| id != from).collect()
+    }
+
+    fn open_move(&mut self, list: String, task: String) {
+        if self.move_targets(&list).is_empty() {
+            self.flash("Немає іншого списку", true);
+            return;
+        }
+        self.mode = Mode::MoveTo { list, task, sel: 0 };
+    }
+
+    fn move_task(&mut self, list: &str, id: &str, dest: &str) {
+        if list == dest || self.list(dest).is_none() {
+            return;
+        }
+        let Some(src) = self.st.tasks.get_mut(list) else { return };
+        // Subtasks travel with their parent; a moved subtask becomes a top-level task.
+        let (mut moved, keep): (Vec<Task>, Vec<Task>) =
+            src.drain(..).partition(|t| t.id == id || t.parent.as_deref() == Some(id));
+        *src = keep;
+        if moved.is_empty() {
+            return;
+        }
+        for t in &mut moved {
+            if t.id == id {
+                t.parent = None;
+                t.position = String::new();
+            }
+        }
+        self.st.tasks.entry(dest.to_string()).or_default().extend(moved);
+        self.push(Op::MoveTask { list: list.into(), task: id.into(), dest: dest.into() });
+        let name = self.list(dest).map(|l| l.title.clone()).unwrap_or_default();
+        self.flash(format!("Перенесено в «{name}»"), false);
+        if !self.select_task(dest, id) {
+            self.select(dest, 0);
+        }
     }
 
     fn apply_drop(&mut self, list: &str, drop: Drop) {
@@ -965,10 +1037,23 @@ impl App {
                 let from = if matches!(self.mode, Mode::Normal) { 0 } else { self.modal_from.min(self.hits.len()) };
                 let hit = self.hits[from..].iter().rev().find(|(r, _)| r.contains(pos)).map(|(_, c)| c.clone());
                 match hit {
-                    Some(Click::DragTile(list)) => self.drag = Some(Drag { list, from: pos, pos, moved: false }),
+                    Some(Click::DragTile(list)) => {
+                        self.drag = Some(Drag { item: DragItem::Tile(list), from: pos, pos, moved: false })
+                    }
+                    Some(Click::Select(list, row)) if matches!(self.mode, Mode::Normal) => {
+                        self.on_click(Click::Select(list.clone(), row));
+                        // A task row can be dragged onto another tile.
+                        if let (Mode::Normal, Some((l, task))) = (&self.mode, self.selected_ids()) {
+                            if l == list {
+                                self.drag = Some(Drag { item: DragItem::Task { list, task }, from: pos, pos, moved: false });
+                            }
+                        }
+                    }
                     Some(c) => self.on_click(c),
                     // Clicking outside a dialog closes it, except while typing.
-                    None if matches!(self.mode, Mode::Confirm { .. } | Mode::Help) => self.mode = Mode::Normal,
+                    None if matches!(self.mode, Mode::Confirm { .. } | Mode::Help | Mode::MoveTo { .. }) => {
+                        self.mode = Mode::Normal
+                    }
                     // Clicking the dimmed backdrop puts the tracker back in the pocket.
                     None if matches!(self.mode, Mode::Normal) && self.pocket && !self.panel.contains(pos) => self.hide(),
                     None => {}
@@ -982,16 +1067,23 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(d) = self.drag.take() {
-                    if !d.moved {
-                        self.on_click(Click::Select(d.list, 0));
-                    } else {
-                        let list = d.list.clone();
-                        self.drag = Some(Drag { pos, ..d });
-                        let target = self.drop_target(pos);
-                        self.drag = None;
-                        if let Some(t) = target {
-                            self.apply_drop(&list, t);
+                    let moved = d.moved;
+                    self.drag = Some(Drag { pos, ..d });
+                    let (tile_target, task_target) = (self.drop_target(pos), self.task_drop_list(pos));
+                    let d = self.drag.take().unwrap();
+                    match d.item {
+                        DragItem::Tile(list) if !moved => self.on_click(Click::Select(list, 0)),
+                        DragItem::Tile(list) => {
+                            if let Some(t) = tile_target {
+                                self.apply_drop(&list, t);
+                            }
                         }
+                        DragItem::Task { list, task } if moved && matches!(self.mode, Mode::Normal) => {
+                            if let Some(dest) = task_target {
+                                self.move_task(&list, &task, &dest);
+                            }
+                        }
+                        DragItem::Task { .. } => {}
                     }
                 }
             }
@@ -1050,6 +1142,12 @@ impl App {
             Click::EditNotes(l, t) => self.edit(|list, task| InputKind::Notes { list, task }, l, t),
             Click::EditDue(l, t) => self.edit(|list, task| InputKind::Due { list, task }, l, t),
             Click::DeleteTask(l, t) => self.ask_delete_task(l, t),
+            Click::MoveTask(l, t) => self.open_move(l, t),
+            Click::MoveTo(dest) => {
+                if let Mode::MoveTo { list, task, .. } = std::mem::replace(&mut self.mode, Mode::Normal) {
+                    self.move_task(&list, &task, &dest);
+                }
+            }
             Click::DeleteCompleted(l) => self.ask_delete_completed(l),
             Click::AddList => self.open_input(InputKind::NewList, ""),
             Click::RenameList(l) => self.rename_list(l),
@@ -1097,6 +1195,29 @@ impl App {
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.key_normal(k),
             Mode::Help => {}
+            Mode::MoveTo { list, task, sel } => {
+                let targets = self.move_targets(&list);
+                let n = targets.len();
+                let code = match k.code {
+                    KeyCode::Char(c) => KeyCode::Char(latin(c)),
+                    c => c,
+                };
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => {}
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => {
+                        if let Some(dest) = targets.get(sel) {
+                            self.move_task(&list, &task, dest);
+                        }
+                    }
+                    KeyCode::Char(c @ '1'..='9') => match targets.get(c as usize - '1' as usize) {
+                        Some(dest) => self.move_task(&list, &task, dest),
+                        None => self.mode = Mode::MoveTo { list, task, sel },
+                    },
+                    KeyCode::Char('j') | KeyCode::Down => self.mode = Mode::MoveTo { list, task, sel: (sel + 1) % n },
+                    KeyCode::Char('k') | KeyCode::Up => self.mode = Mode::MoveTo { list, task, sel: (sel + n - 1) % n },
+                    _ => self.mode = Mode::MoveTo { list, task, sel },
+                }
+            }
             Mode::Confirm { what, msg } => match k.code {
                 KeyCode::Enter => self.confirm(what),
                 KeyCode::Char(c) if latin(c) == 'y' => self.confirm(what),
@@ -1187,6 +1308,7 @@ impl App {
                     KeyCode::Enter | KeyCode::Char('e') => self.edit(|list, task| InputKind::Title { list, task }, list, task),
                     KeyCode::Char('i') => self.edit(|list, task| InputKind::Notes { list, task }, list, task),
                     KeyCode::Char('d') => self.edit(|list, task| InputKind::Due { list, task }, list, task),
+                    KeyCode::Char('m') => self.open_move(list, task),
                     KeyCode::Char('a') | KeyCode::Char('o') | KeyCode::Char('n') => self.add_task(list, None),
                     KeyCode::Char('A') | KeyCode::Char('O') => self.add_subtask(list, &task),
                     KeyCode::Char('x') | KeyCode::Char('D') | KeyCode::Delete => self.ask_delete_task(list, task),
@@ -1212,6 +1334,36 @@ mod tests {
         assert_eq!(e.cur, 6);
         e.delete_word_back();
         assert_eq!(e.text(), "abc\n");
+    }
+
+    #[test]
+    fn nearest_deadline_first() {
+        let mut st = State::default();
+        st.lists.push(TaskList { id: "l".into(), title: "L".into() });
+        let t = |id: &str, due: Option<&str>, parent: Option<&str>| Task {
+            id: id.into(),
+            title: id.into(),
+            status: "needsAction".into(),
+            due: due.map(|d| format!("{d}T00:00:00.000Z")),
+            parent: parent.map(String::from),
+            position: id.into(),
+            ..Default::default()
+        };
+        st.tasks.insert(
+            "l".into(),
+            vec![
+                t("a", None, None),
+                t("b", Some("2026-11-05"), None),
+                t("c", Some("2026-10-30"), None),
+                t("d", None, None),
+                t("e", Some("2026-11-01"), Some("b")),
+                t("f", Some("2026-10-31"), Some("b")),
+            ],
+        );
+        let app = App::new(st, std::sync::mpsc::channel().0, false);
+        let order: Vec<&str> =
+            app.task_rows("l").iter().map(|&(i, _)| app.list_tasks("l")[i].id.as_str()).collect();
+        assert_eq!(order, ["c", "b", "f", "e", "a", "d"]);
     }
 
     #[test]
