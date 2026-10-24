@@ -839,7 +839,7 @@ fn draw_help(f: &mut Frame) {
         ("", "тягніть завдання: на інше — стане"),
         ("", "підзавданням, на плитку — окремим"),
         ("Ctrl+клік", "вибрати кілька (або v, правий клік);"),
-        ("Alt+клік", "вибрати проміжок; m, e і перетягування"),
+        ("Shift+клік", "вибрати проміжок; m, e і перетягування"),
         ("", "діють на всі вибрані; e: * — змінна"),
         ("", "частина назви, Esc — скинути вибір"),
         ("x  Del", "видалити"),
@@ -851,7 +851,7 @@ fn draw_help(f: &mut Frame) {
     ];
     let lines: Vec<Line> = KEYS
         .iter()
-        .map(|(k, d)| Line::from(vec![Span::raw(format!(" {k:<9}")).fg(ACCENT).bold(), Span::raw(*d)]))
+        .map(|(k, d)| Line::from(vec![Span::raw(format!(" {k:<10}")).fg(ACCENT).bold(), Span::raw(*d)]))
         .collect();
     let r = popup(f.area(), 58, KEYS.len() as u16 + 2);
     surface(f, r, BASE);
@@ -1173,7 +1173,7 @@ mod tests {
         };
         ctrl(&mut app, r6, KeyModifiers::CONTROL);
         let r7 = hit(&app, Click::Select("c".into(), 3));
-        ctrl(&mut app, r7, KeyModifiers::ALT);
+        ctrl(&mut app, r7, KeyModifiers::SHIFT);
         assert_eq!(app.marked, ["6", "7"]);
         let screen = render(&mut app);
         assert!(screen.contains("вибрано 2"), "{screen}");

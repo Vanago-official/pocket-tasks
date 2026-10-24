@@ -1,11 +1,17 @@
 #!/bin/sh
 # Waybar/keybind entry point: show or hide the pocket tracker, launching it on first use.
 # The window covers the whole screen; its translucent background (blurred by Hyprland)
-# dims the desktop around the opaque panel drawn by ptask.
+# dims the desktop around the opaque panel drawn by ptask. Ctrl/Shift+click must reach
+# ptask (task selection), so foot's own selection bindings with modifiers are dropped
+# (Super, the override, is taken by Hyprland, so text selection is off here).
 if hyprctl clients -j | grep -q '"class": "ptask"'; then
     hyprctl dispatch 'hl.dsp.workspace.toggle_special("ptask")' >/dev/null
 else
     PTASK_POCKET=1 setsid -f foot --app-id=ptask --title="Pocket Tasks" \
         -o pad=0x0 -o colors-dark.alpha="${PTASK_DIM:-0.8}" \
+        -o mouse-bindings.selection-override-modifiers=Mod4 \
+        -o mouse-bindings.select-begin-block=none \
+        -o mouse-bindings.select-word-whitespace=none \
+        -o mouse-bindings.select-extend-character-wise=none \
         "$HOME/.local/bin/ptask" >/dev/null 2>&1
 fi

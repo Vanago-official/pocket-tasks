@@ -1309,12 +1309,12 @@ impl App {
                             _ => None,
                         };
                         if let Some(id) = &row_task {
-                            // Ctrl+click picks one task, Alt+click a run of them.
+                            // Ctrl+click picks one task, Shift/Alt+click a run of them.
                             if m.modifiers.contains(KeyModifiers::CONTROL) {
                                 self.toggle_mark(id);
                                 return self.select(&list, row);
                             }
-                            if m.modifiers.contains(KeyModifiers::ALT) {
+                            if m.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
                                 self.mark_range(&list, row);
                                 return self.select(&list, row);
                             }
