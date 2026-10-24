@@ -1,4 +1,5 @@
 use crate::api::ApiError;
+use chrono::NaiveDate;
 use crate::date;
 use crate::model::{Op, State, Task, TaskList};
 use crate::sync::{Created, Req, Resp};
@@ -109,6 +110,9 @@ pub enum InputKind {
     Due { list: String, task: String },
     NewList,
     RenameList { list: String },
+    /// Rename several tasks through a template; `*` stands for the part that differs
+    /// (`pre`/`suf` chars of each old title are the shared prefix/suffix).
+    Rename { tasks: Vec<(String, String)>, pre: usize, suf: usize },
 }
 
 impl InputKind {
@@ -221,6 +225,31 @@ impl Editor {
 }
 
 /// Lets hotkeys work while the Ukrainian layout is active.
+/// Lengths of the prefix and suffix all titles share, never cutting a word or number
+/// in two, so `Practice 7` / `Practice 17` share `Practice `, not `Practice `+`7`.
+fn common_affixes(titles: &[Vec<char>]) -> (usize, usize) {
+    let Some(first) = titles.first() else { return (0, 0) };
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+    let mut pre = titles.iter().map(|t| t.iter().zip(first).take_while(|(a, b)| a == b).count()).min().unwrap_or(0);
+    while pre > 0 && word(first.get(pre - 1)) && titles.iter().any(|t| word(t.get(pre))) {
+        pre -= 1;
+    }
+    let room = titles.iter().map(|t| t.len() - pre).min().unwrap_or(0);
+    let mut suf = titles
+        .iter()
+        .map(|t| t.iter().rev().zip(first.iter().rev()).take_while(|(a, b)| a == b).count())
+        .min()
+        .unwrap_or(0)
+        .min(room);
+    while suf > 0
+        && word(first.get(first.len() - suf))
+        && titles.iter().any(|t| t.len() > suf && t.len() - suf > pre && word(t.get(t.len() - suf - 1)))
+    {
+        suf -= 1;
+    }
+    (pre, suf)
+}
+
 fn latin(c: char) -> char {
     const UA: &str = "йцукенгшщзхїфівапролджєячсмитьбюЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ";
     const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>";
@@ -248,6 +277,8 @@ pub struct App {
     pub drag: Option<Drag>,
     /// Where a dragged task would land, worked out from the previous frame.
     pub task_drop: Option<TaskDrop>,
+    /// Tasks picked with Ctrl+click / `v`, in picking order.
+    pub marked: Vec<String>,
     pub busy: bool,
     pub net_error: Option<String>,
     pub auth_error: Option<String>,
@@ -283,6 +314,7 @@ impl App {
             hover: None,
             drag: None,
             task_drop: None,
+            marked: Vec::new(),
             busy: false,
             net_error: None,
             auth_error: None,
@@ -330,6 +362,15 @@ impl App {
     pub fn subtask_count(&self, list: &str, task: &str) -> usize {
         let show_done = self.st.show_completed;
         self.list_tasks(list).iter().filter(|t| t.parent.as_deref() == Some(task) && (show_done || !t.done())).count()
+    }
+
+    /// Nearest deadline among the open subtasks of a task.
+    pub fn nearest_subtask_due(&self, list: &str, task: &str) -> Option<NaiveDate> {
+        self.list_tasks(list)
+            .iter()
+            .filter(|t| t.parent.as_deref() == Some(task) && !t.done())
+            .filter_map(|t| t.due_date())
+            .min()
     }
 
     /// Tasks of one list as (index into its vec, depth): open tasks with their subtasks,
@@ -635,6 +676,87 @@ impl App {
         self.mode = Mode::MoveTo { list, task, sel: 0 };
     }
 
+    fn list_of(&self, task: &str) -> Option<String> {
+        self.st.tasks.iter().find(|(_, ts)| ts.iter().any(|t| t.id == task)).map(|(l, _)| l.clone())
+    }
+
+    pub fn is_marked(&self, task: &str) -> bool {
+        self.marked.iter().any(|m| m == task)
+    }
+
+    /// Tasks an action on `task` applies to: the whole marked group when it includes it.
+    pub fn group(&self, list: &str, task: &str) -> Vec<(String, String)> {
+        if !self.is_marked(task) {
+            return vec![(list.to_string(), task.to_string())];
+        }
+        self.marked.iter().filter_map(|id| Some((self.list_of(id)?, id.clone()))).collect()
+    }
+
+    fn toggle_mark(&mut self, task: &str) {
+        if self.is_marked(task) {
+            self.marked.retain(|m| m != task);
+        } else {
+            self.marked.push(task.to_string());
+        }
+    }
+
+    /// Marks every task between the selected row and `row` of the same tile.
+    fn mark_range(&mut self, list: &str, row: usize) {
+        let from = if self.sel.list == list { self.sel.row } else { row };
+        let rows = self.tile_rows(list);
+        let tasks = self.list_tasks(list);
+        let ids: Vec<String> = (from.min(row)..=from.max(row))
+            .filter_map(|r| match rows.get(r) {
+                Some(TileRow::Task { task, .. }) => Some(tasks[*task].id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in ids {
+            if !self.is_marked(&id) {
+                self.marked.push(id);
+            }
+        }
+    }
+
+    fn clear_marks(&mut self) {
+        self.marked.clear();
+    }
+
+    /// Moves `task`, or its whole marked group, like a single drop.
+    fn move_group(&mut self, list: &str, task: &str, dest: &str, parent: Option<String>) {
+        let group = self.group(list, task);
+        if group.len() < 2 {
+            return self.move_task(list, task, dest, parent);
+        }
+        let ids: HashSet<&str> = group.iter().map(|(_, t)| t.as_str()).collect();
+        let (mut moved, mut blocked) = (0, 0);
+        let mut todo = Vec::new();
+        for (l, id) in &group {
+            let Some(t) = self.list_tasks(l).iter().find(|t| t.id == *id) else { continue };
+            // Subtasks of a marked parent travel with it; nothing nests into itself.
+            if t.parent.as_deref().is_some_and(|p| ids.contains(p)) || parent.as_deref() == Some(id) {
+                continue;
+            }
+            if l == dest && t.parent == parent {
+                continue;
+            }
+            if self.nest_blocker(l, id, parent.as_deref()).is_some() {
+                blocked += 1;
+                continue;
+            }
+            todo.push((l.clone(), id.clone()));
+        }
+        for (l, id) in todo {
+            self.move_task(&l, &id, dest, parent.clone());
+            moved += 1;
+        }
+        let mut msg = format!("Перенесено завдань: {moved}");
+        if blocked > 0 {
+            msg += &format!(" · {blocked} з підзавданнями не вкласти");
+        }
+        self.flash(msg, blocked > 0);
+    }
+
     fn move_task(&mut self, list: &str, id: &str, dest: &str, parent: Option<String>) {
         if self.list(dest).is_none() {
             return;
@@ -826,6 +948,7 @@ impl App {
                     self.st.collapsed.retain(|id| ids.contains(id));
                     let task_ids: HashSet<&String> = self.st.tasks.values().flatten().map(|t| &t.id).collect();
                     self.st.collapsed_tasks.retain(|id| task_ids.contains(id));
+                    self.marked.retain(|id| task_ids.contains(id));
                     self.normalize_layout();
                     if !sel_task.is_some_and(|(l, t)| self.select_task(&l, &t)) {
                         self.clamp();
@@ -851,6 +974,9 @@ impl App {
                     t.parent = Some(real.id.clone());
                 }
             }
+        }
+        for m in self.marked.iter_mut().filter(|m| *m == tmp) {
+            *m = real.id.clone();
         }
         if self.st.collapsed_tasks.remove(tmp) {
             self.st.collapsed_tasks.insert(real.id.clone());
@@ -944,6 +1070,12 @@ impl App {
     fn edit(&mut self, what: fn(String, String) -> InputKind, list: String, task: String) {
         let Some(t) = self.list_tasks(&list).iter().find(|t| t.id == task).cloned() else { return };
         let kind = what(list, task);
+        if let InputKind::Title { list, task } = &kind {
+            let group = self.group(list, task);
+            if group.len() > 1 {
+                return self.rename_group(group);
+            }
+        }
         let text = match kind {
             InputKind::Title { .. } => t.title,
             InputKind::Notes { .. } => t.notes.unwrap_or_default(),
@@ -951,6 +1083,19 @@ impl App {
             _ => String::new(),
         };
         self.open_input(kind, &text);
+    }
+
+    fn rename_group(&mut self, tasks: Vec<(String, String)>) {
+        let titles: Vec<Vec<char>> = tasks
+            .iter()
+            .filter_map(|(l, id)| self.list_tasks(l).iter().find(|t| t.id == *id))
+            .map(|t| t.title.chars().collect())
+            .collect();
+        let (pre, suf) = common_affixes(&titles);
+        let first = &titles[0];
+        let template: String =
+            first[..pre].iter().chain(['*'].iter()).chain(first[first.len() - suf..].iter()).collect();
+        self.open_input(InputKind::Rename { tasks, pre, suf }, &template);
     }
 
     fn ask_delete_task(&mut self, list: String, task: String) {
@@ -1015,6 +1160,8 @@ impl App {
             // Google removes subtasks together with their parent.
             tasks.retain(|t| t.id != id && t.parent.as_deref() != Some(id));
         }
+        let left: HashSet<String> = self.st.tasks.values().flatten().map(|t| t.id.clone()).collect();
+        self.marked.retain(|m| left.contains(m));
         self.push(Op::DeleteTask { list: list.into(), task: id.into() });
         self.clamp();
     }
@@ -1049,6 +1196,26 @@ impl App {
                     t.title = trimmed.clone();
                 }
                 self.patch(list, task, json!({ "title": trimmed }));
+            }
+            InputKind::Rename { tasks, pre, suf } => {
+                let mut renamed = 0;
+                for (list, task) in tasks {
+                    let Some(t) = self.list_tasks(&list).iter().find(|t| t.id == task) else { continue };
+                    let old: Vec<char> = t.title.chars().collect();
+                    let a = pre.min(old.len());
+                    let b = old.len().saturating_sub(suf).max(a);
+                    let part: String = old[a..b].iter().collect();
+                    let title = trimmed.replacen('*', &part, 1).trim().to_string();
+                    if title.is_empty() || title == t.title {
+                        continue;
+                    }
+                    if let Some(t) = self.task_mut(&list, &task) {
+                        t.title = title.clone();
+                    }
+                    self.patch(list, task, json!({ "title": title }));
+                    renamed += 1;
+                }
+                self.flash(format!("Перейменовано завдань: {renamed}"), false);
             }
             InputKind::Notes { list, task } => {
                 let notes = text.trim_end().to_string();
@@ -1137,6 +1304,24 @@ impl App {
                         self.drag = Some(Drag { item: DragItem::Tile(list), from: pos, pos, moved: false })
                     }
                     Some(Click::Select(list, row)) if matches!(self.mode, Mode::Normal) => {
+                        let row_task = match self.tile_rows(&list).get(row) {
+                            Some(TileRow::Task { task, .. }) => Some(self.list_tasks(&list)[*task].id.clone()),
+                            _ => None,
+                        };
+                        if let Some(id) = &row_task {
+                            // Ctrl+click picks one task, Alt+click a run of them.
+                            if m.modifiers.contains(KeyModifiers::CONTROL) {
+                                self.toggle_mark(id);
+                                return self.select(&list, row);
+                            }
+                            if m.modifiers.contains(KeyModifiers::ALT) {
+                                self.mark_range(&list, row);
+                                return self.select(&list, row);
+                            }
+                            if !self.is_marked(id) {
+                                self.clear_marks();
+                            }
+                        }
                         self.on_click(Click::Select(list.clone(), row));
                         // A task row can be dragged onto another tile.
                         if let (Mode::Normal, Some((l, task))) = (&self.mode, self.selected_ids()) {
@@ -1153,6 +1338,16 @@ impl App {
                     // Clicking the dimmed backdrop puts the tracker back in the pocket.
                     None if matches!(self.mode, Mode::Normal) && self.pocket && !self.panel.contains(pos) => self.hide(),
                     None => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if matches!(self.mode, Mode::Normal) => {
+                let hit = self.hits.iter().rev().find(|(r, _)| r.contains(pos)).map(|(_, c)| c.clone());
+                if let Some(Click::Select(list, row)) = hit {
+                    if let Some(TileRow::Task { task, .. }) = self.tile_rows(&list).get(row) {
+                        let id = self.list_tasks(&list)[*task].id.clone();
+                        self.toggle_mark(&id);
+                        self.select(&list, row);
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1176,7 +1371,7 @@ impl App {
                         }
                         DragItem::Task { list, task } if moved && matches!(self.mode, Mode::Normal) => {
                             if let Some(TaskDrop { list: dest, parent }) = task_target {
-                                self.move_task(&list, &task, &dest, parent);
+                                self.move_group(&list, &task, &dest, parent);
                             }
                         }
                         DragItem::Task { .. } => {}
@@ -1247,7 +1442,7 @@ impl App {
             Click::MoveTask(l, t) => self.open_move(l, t),
             Click::MoveTo(dest) => {
                 if let Mode::MoveTo { list, task, .. } = std::mem::replace(&mut self.mode, Mode::Normal) {
-                    self.move_task(&list, &task, &dest, None);
+                    self.move_group(&list, &task, &dest, None);
                 }
             }
             Click::DeleteCompleted(l) => self.ask_delete_completed(l),
@@ -1308,11 +1503,11 @@ impl App {
                     KeyCode::Esc | KeyCode::Char('q') => {}
                     KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => {
                         if let Some(dest) = targets.get(sel) {
-                            self.move_task(&list, &task, dest, None);
+                            self.move_group(&list, &task, dest, None);
                         }
                     }
                     KeyCode::Char(c @ '1'..='9') => match targets.get(c as usize - '1' as usize) {
-                        Some(dest) => self.move_task(&list, &task, dest, None),
+                        Some(dest) => self.move_group(&list, &task, dest, None),
                         None => self.mode = Mode::MoveTo { list, task, sel },
                     },
                     KeyCode::Char('j') | KeyCode::Down => self.mode = Mode::MoveTo { list, task, sel: (sel + 1) % n },
@@ -1357,6 +1552,7 @@ impl App {
         match code {
             KeyCode::Char('l') if ctrl => return self.login_requested = true,
             KeyCode::Char('Q') => return self.quit = true,
+            KeyCode::Esc if !self.marked.is_empty() => return self.clear_marks(),
             KeyCode::Char('q') | KeyCode::Esc => return self.hide(),
             KeyCode::Char('?') | KeyCode::F(1) => return self.mode = Mode::Help,
             KeyCode::Char('r') => return self.refresh_now(),
@@ -1412,6 +1608,10 @@ impl App {
                     KeyCode::Char('d') => self.edit(|list, task| InputKind::Due { list, task }, list, task),
                     KeyCode::Char('m') => self.open_move(list, task),
                     KeyCode::Char('s') => self.toggle_subtasks(&list, &task),
+                    KeyCode::Char('v') => {
+                        self.toggle_mark(&task);
+                        self.move_v(1);
+                    }
                     KeyCode::Char('a') | KeyCode::Char('o') | KeyCode::Char('n') => self.add_task(list, None),
                     KeyCode::Char('A') | KeyCode::Char('O') => self.add_subtask(list, &task),
                     KeyCode::Char('x') | KeyCode::Char('D') | KeyCode::Delete => self.ask_delete_task(list, task),
@@ -1467,6 +1667,15 @@ mod tests {
         let order: Vec<&str> =
             app.task_rows("l").iter().map(|&(i, _)| app.list_tasks("l")[i].id.as_str()).collect();
         assert_eq!(order, ["c", "b", "f", "e", "a", "d"]);
+    }
+
+    #[test]
+    fn shared_title_parts() {
+        let t = |v: &[&str]| common_affixes(&v.iter().map(|s| s.chars().collect()).collect::<Vec<_>>());
+        assert_eq!(t(&["Networking Concepts Practice 7", "Networking Concepts Practice 8"]), (29, 0));
+        assert_eq!(t(&["Practice 17", "Practice 18"]), (9, 0));
+        assert_eq!(t(&["Lab 1 notes", "Lab 2 notes"]), (4, 6));
+        assert_eq!(t(&["Звіт", "Лист"]), (0, 0));
     }
 
     #[test]

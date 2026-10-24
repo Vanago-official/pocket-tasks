@@ -1,6 +1,7 @@
 use crate::app::{App, Click, DragItem, Drop, InputKind, Mode, TileRow};
 use crate::date;
 use crate::model::Task;
+use chrono::NaiveDate;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -26,6 +27,8 @@ const DIM: Style = Style::new().fg(OVERLAY);
 const BTN: Style = Style::new().fg(MAUVE).bg(SURFACE0);
 const BTN_HOVER: Style = Style::new().fg(CRUST).bg(MAUVE);
 const SELECTED_BG: Color = SURFACE0;
+const MARKED_BG: Color = Color::Rgb(0x3e, 0x35, 0x58);
+const MARKED_SEL_BG: Color = Color::Rgb(0x55, 0x48, 0x78);
 /// Narrowest column before the board starts scrolling sideways.
 const MIN_COL_W: u16 = 34;
 
@@ -209,9 +212,13 @@ fn draw_toolbar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn due_label(t: &Task) -> (String, Style) {
+    date_label(t.due_date(), t.done())
+}
+
+fn date_label(due: Option<NaiveDate>, done: bool) -> (String, Style) {
     let today = date::today();
-    match t.due_date() {
-        Some(d) if !t.done() => {
+    match due {
+        Some(d) if !done => {
             let st = if d < today {
                 Style::new().fg(RED).bold()
             } else if d == today {
@@ -424,8 +431,11 @@ fn draw_tile(f: &mut Frame, app: &mut App, id: &str, r: Rect) {
         let active = sel_row || hovered(app, row_rect);
         let is_nest_target = matches!(*row, TileRow::Task { task, .. }
             if nest_target.as_deref() == Some(app.list_tasks(id)[task].id.as_str()));
+        let marked = matches!(*row, TileRow::Task { task, .. } if app.is_marked(&app.list_tasks(id)[task].id));
         if is_nest_target {
             f.render_widget(Block::new().bg(SURFACE1), row_rect);
+        } else if marked {
+            f.render_widget(Block::new().bg(if sel_row { MARKED_SEL_BG } else { MARKED_BG }), row_rect);
         } else if sel_row {
             f.render_widget(Block::new().bg(SELECTED_BG), row_rect);
         }
@@ -454,7 +464,17 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
     let ids = || (list.to_string(), t.id.clone());
 
     let mut right = Seg::default();
-    let (due, due_style) = due_label(t);
+    let subs = if depth == 0 { app.subtask_count(list, &t.id) } else { 0 };
+    let folded = subs > 0 && app.st.collapsed_tasks.contains(&t.id);
+    // A folded task shows the nearest subtask deadline (marked ↳) when it comes first.
+    let sub_due = if folded && !t.done() { app.nearest_subtask_due(list, &t.id) } else { None };
+    let (due, due_style) = match sub_due {
+        Some(d) if t.due_date().is_none_or(|own| d < own) => {
+            let (l, st) = date_label(Some(d), false);
+            (format!("↳{l}"), st)
+        }
+        _ => due_label(t),
+    };
     if !due.is_empty() {
         right.text(format!("{due} "), due_style);
     }
@@ -471,8 +491,6 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
 
     let mut s = Seg::default();
     // Top-level tasks carry a fold arrow when they have subtasks.
-    let subs = if depth == 0 { app.subtask_count(list, &t.id) } else { 0 };
-    let folded = app.st.collapsed_tasks.contains(&t.id);
     if subs > 0 {
         s.text(" ", Style::new()).click(
             if folded { "▸ " } else { "▾ " },
@@ -487,7 +505,7 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
     let (l, id) = ids();
     s.click(format!("{mark} "), style, Some(Style::new().fg(ACCENT).bold()), Click::ToggleDone(l, id));
     let note = if t.notes.is_some() { " ≡" } else { "" };
-    let hidden = if folded && subs > 0 { format!(" +{subs}") } else { String::new() };
+    let hidden = if folded { format!(" +{subs}") } else { String::new() };
     let avail = w.saturating_sub((s.w + right.w) as usize + note.chars().count() + hidden.chars().count() + 1);
     let title_style = if t.done() { DIM.crossed_out() } else { Style::new() };
     s.text(truncate(&t.title, avail), title_style);
@@ -522,7 +540,9 @@ fn draw_drag(f: &mut Frame, app: &mut App) {
                 },
                 None => " → на завдання чи іншу плитку".into(),
             };
-            let label = format!(" ⠿ {}{to} ", truncate(&name.unwrap_or_default(), 30));
+            let n = app.group(list, task).len();
+            let name = if n > 1 { format!("{n} завдань") } else { truncate(&name.unwrap_or_default(), 30) };
+            let label = format!(" ⠿ {name}{to} ");
             let area = f.area();
             let w = (label.chars().count() as u16).min(area.width);
             let x = (pos.x + 1).min(area.right().saturating_sub(w));
@@ -641,6 +661,9 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         (" · ".to_string(), DIM, Click::Refresh)
     };
     let mut s = Seg::default();
+    if !app.marked.is_empty() {
+        s.text(format!(" ● вибрано {} · Esc — скинути ", app.marked.len()), BTN);
+    }
     s.click(text, style, Some(Style::new().add_modifier(Modifier::UNDERLINED)), click);
     if let Some((m, err, at)) = &app.flash {
         if at.elapsed().as_secs() < 4 {
@@ -699,14 +722,15 @@ fn wrap_editor(chars: &[char], cur: usize, width: usize) -> (Vec<String>, (usize
 
 fn draw_input(f: &mut Frame, app: &mut App) {
     let Mode::Input { kind, ed } = &app.mode else { return };
-    let title = match kind {
-        InputKind::NewTask { parent: None, .. } => " Нове завдання ",
-        InputKind::NewTask { .. } => " Нове підзавдання ",
-        InputKind::Title { .. } => " Назва ",
-        InputKind::Notes { .. } => " Опис · Enter — новий рядок, Ctrl+S — зберегти ",
-        InputKind::Due { .. } => " Дедлайн · завтра, +3, пт, 25.10 ",
-        InputKind::NewList => " Новий список ",
-        InputKind::RenameList { .. } => " Назва списку ",
+    let title: String = match kind {
+        InputKind::Rename { tasks, .. } => format!(" Назва {} завдань · * — частина, що відрізняється ", tasks.len()),
+        InputKind::NewTask { parent: None, .. } => " Нове завдання ".into(),
+        InputKind::NewTask { .. } => " Нове підзавдання ".into(),
+        InputKind::Title { .. } => " Назва ".into(),
+        InputKind::Notes { .. } => " Опис · Enter — новий рядок, Ctrl+S — зберегти ".into(),
+        InputKind::Due { .. } => " Дедлайн · завтра, +3, пт, 25.10 ".into(),
+        InputKind::NewList => " Новий список ".into(),
+        InputKind::RenameList { .. } => " Назва списку ".into(),
     };
     let is_due = matches!(kind, InputKind::Due { .. });
     let area = app.panel;
@@ -765,7 +789,9 @@ fn draw_move(f: &mut Frame, app: &mut App, list: &str, task: &str, sel: usize) {
     let name = app.list_tasks(list).iter().find(|t| t.id == task).map(|t| t.title.clone()).unwrap_or_default();
     let r = popup(app.panel, 50, targets.len() as u16 + 3);
     surface(f, r, BASE);
-    f.render_widget(block(format!(" Перенести «{}» ", truncate(&name, 30)), true), r);
+    let n = app.group(list, task).len();
+    let what = if n > 1 { format!("{n} завдань") } else { format!("«{}»", truncate(&name, 30)) };
+    f.render_widget(block(format!(" Перенести {what} "), true), r);
     let w = r.width.saturating_sub(2);
     for (i, id) in targets.iter().enumerate() {
         let y = r.y + 1 + i as u16;
@@ -812,6 +838,10 @@ fn draw_help(f: &mut Frame) {
         ("m  ⇄", "перенести в інший список"),
         ("", "тягніть завдання: на інше — стане"),
         ("", "підзавданням, на плитку — окремим"),
+        ("Ctrl+клік", "вибрати кілька (або v, правий клік);"),
+        ("Alt+клік", "вибрати проміжок; m, e і перетягування"),
+        ("", "діють на всі вибрані; e: * — змінна"),
+        ("", "частина назви, Esc — скинути вибір"),
         ("x  Del", "видалити"),
         ("c / C", "показати виконані / видалити їх"),
         ("r", "синхронізувати зараз"),
@@ -1107,6 +1137,15 @@ mod tests {
         assert_eq!(app.selected_task().map(|t| t.id.as_str()), Some("1"), "selection moves to the parent");
         assert!(app.st.collapsed_tasks.contains("1"));
 
+        // A folded parent shows its nearest subtask deadline.
+        let today = date::today();
+        let soon = today + chrono::Duration::days(3);
+        app.st.tasks.get_mut("a").unwrap()[1].due = Some(date::to_api(soon));
+        let label = format!("↳{}", date::human(soon, today));
+        assert!(render(&mut app).contains(&label), "{}", render(&mut app));
+        app.st.tasks.get_mut("a").unwrap()[0].due = Some(date::to_api(today));
+        assert!(!render(&mut app).contains(&label), "own earlier deadline wins");
+
         // `s` unfolds again, from the parent or from a subtask.
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), KeyModifiers::NONE));
         assert!(render(&mut app).contains("Знежирене"));
@@ -1117,6 +1156,49 @@ mod tests {
         app.select_task_pub("a", "3");
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), KeyModifiers::NONE));
         assert!(!app.st.collapsed_tasks.contains("3"));
+    }
+
+    #[test]
+    fn multi_select_move_and_rename() {
+        let mut app = sample();
+        app.st.tasks.get_mut("c").unwrap().extend([
+            Task { id: "6".into(), title: "Networking Concepts Practice 7".into(), position: "6".into(), ..Default::default() },
+            Task { id: "7".into(), title: "Networking Concepts Practice 8".into(), position: "7".into(), ..Default::default() },
+        ]);
+        render(&mut app);
+        // Ctrl+click picks one task, Alt+click extends to a run.
+        let r6 = hit(&app, Click::Select("c".into(), 2));
+        let ctrl = |app: &mut App, r: Rect, m: KeyModifiers| {
+            app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 10, row: r.y, modifiers: m })
+        };
+        ctrl(&mut app, r6, KeyModifiers::CONTROL);
+        let r7 = hit(&app, Click::Select("c".into(), 3));
+        ctrl(&mut app, r7, KeyModifiers::ALT);
+        assert_eq!(app.marked, ["6", "7"]);
+        let screen = render(&mut app);
+        assert!(screen.contains("вибрано 2"), "{screen}");
+
+        // e renames both through a template.
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('e'), KeyModifiers::NONE));
+        let Mode::Input { ed, .. } = &app.mode else { panic!("no input") };
+        assert_eq!(ed.text(), "Networking Concepts Practice *");
+        let Mode::Input { kind, .. } = std::mem::replace(&mut app.mode, Mode::Normal) else { unreachable!() };
+        app.mode = Mode::Input { kind, ed: crate::app::Editor::new("Practice *") };
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::NONE));
+        let titles: Vec<&str> = app.list_tasks("c").iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Хліб", "Practice 7", "Practice 8"]);
+
+        // Dragging one marked task carries the whole group.
+        let to = tile(&app, "a");
+        let screen = drag_task(&mut app, "c", 2, Rect::new(to.x + 5, to.bottom() - 1, 1, 1));
+        assert!(screen.contains("⠿ 2 завдань"), "{screen}");
+        assert!(app.list_tasks("a").iter().any(|t| t.id == "6") && app.list_tasks("a").iter().any(|t| t.id == "7"));
+        assert_eq!(app.list_tasks("c").len(), 1);
+
+        // A plain click on an unmarked task drops the selection; Esc does too.
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.marked.is_empty());
+        assert!(!app.quit);
     }
 
     #[test]
