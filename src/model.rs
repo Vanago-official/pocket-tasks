@@ -107,6 +107,9 @@ pub struct State {
     /// Lists folded in the tree view; kept across restarts.
     #[serde(default)]
     pub collapsed: HashSet<String>,
+    /// Tasks whose subtasks are folded away; kept across restarts.
+    #[serde(default)]
+    pub collapsed_tasks: HashSet<String>,
     /// Board layout: columns of list ids, top to bottom.
     #[serde(default)]
     pub layout: Vec<Vec<String>>,

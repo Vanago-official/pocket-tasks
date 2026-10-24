@@ -70,6 +70,8 @@ pub enum Click {
     /// Tile header: click selects, drag moves the tile.
     DragTile(String),
     ToggleCollapse(String),
+    /// Fold or unfold the subtasks of a task.
+    ToggleSubtasks(String),
     ToggleDone(String, String),
     AddTask(String),
     AddSubtask(String, String),
@@ -324,6 +326,12 @@ impl App {
         self.st.collapsed.contains(list)
     }
 
+    /// Subtasks of a task that the tile would show when unfolded.
+    pub fn subtask_count(&self, list: &str, task: &str) -> usize {
+        let show_done = self.st.show_completed;
+        self.list_tasks(list).iter().filter(|t| t.parent.as_deref() == Some(task) && (show_done || !t.done())).count()
+    }
+
     /// Tasks of one list as (index into its vec, depth): open tasks with their subtasks,
     /// nearest deadline first (undated ones after, in Google's order), then completed
     /// ones (newest first).
@@ -354,7 +362,9 @@ impl App {
         let mut out = Vec::new();
         for i in open.into_iter().chain(done) {
             out.push((i, 0));
-            out.extend(children(&tasks[i].id).into_iter().map(|c| (c, 1)));
+            if !self.st.collapsed_tasks.contains(&tasks[i].id) {
+                out.extend(children(&tasks[i].id).into_iter().map(|c| (c, 1)));
+            }
         }
         out
     }
@@ -814,6 +824,8 @@ impl App {
                     self.st.tasks = tasks;
                     let ids: HashSet<&String> = self.st.lists.iter().map(|l| &l.id).collect();
                     self.st.collapsed.retain(|id| ids.contains(id));
+                    let task_ids: HashSet<&String> = self.st.tasks.values().flatten().map(|t| &t.id).collect();
+                    self.st.collapsed_tasks.retain(|id| task_ids.contains(id));
                     self.normalize_layout();
                     if !sel_task.is_some_and(|(l, t)| self.select_task(&l, &t)) {
                         self.clamp();
@@ -839,6 +851,9 @@ impl App {
                     t.parent = Some(real.id.clone());
                 }
             }
+        }
+        if self.st.collapsed_tasks.remove(tmp) {
+            self.st.collapsed_tasks.insert(real.id.clone());
         }
         self.st.pending.iter_mut().for_each(|op| op.remap(tmp, &real.id));
     }
@@ -877,6 +892,26 @@ impl App {
             self.clamp();
             self.dirty = true;
         }
+    }
+
+    /// Folds a task's subtasks; a selected subtask hands the selection to its parent.
+    fn toggle_subtasks(&mut self, list: &str, task: &str) {
+        let parent = self.list_tasks(list).iter().find(|t| t.id == task).and_then(|t| t.parent.clone());
+        // On a subtask the toggle applies to its parent.
+        let task = parent.unwrap_or_else(|| task.to_string());
+        if self.subtask_count(list, &task) == 0 {
+            return;
+        }
+        // Checked before folding: afterwards the row indices no longer match.
+        let on_child = self.sel.list == list && self.selected_task().is_some_and(|t| t.parent.as_deref() == Some(&task));
+        if !self.st.collapsed_tasks.remove(&task) {
+            self.st.collapsed_tasks.insert(task.clone());
+            if on_child {
+                self.select_task(list, &task);
+            }
+        }
+        self.clamp();
+        self.dirty = true;
     }
 
     fn toggle_collapse(&mut self, list: &str) {
@@ -1196,6 +1231,12 @@ impl App {
             }
             Click::DragTile(list) => self.select(&list, 0),
             Click::ToggleCollapse(l) => self.toggle_collapse(&l),
+            Click::ToggleSubtasks(t) => {
+                let list = self.st.tasks.iter().find(|(_, ts)| ts.iter().any(|x| x.id == t)).map(|(l, _)| l.clone());
+                if let Some(l) = list {
+                    self.toggle_subtasks(&l, &t);
+                }
+            }
             Click::ToggleDone(l, t) => self.toggle_done(l, t),
             Click::AddTask(l) => self.add_task(l, None),
             Click::AddSubtask(l, t) => self.add_subtask(l, &t),
@@ -1370,6 +1411,7 @@ impl App {
                     KeyCode::Char('i') => self.edit(|list, task| InputKind::Notes { list, task }, list, task),
                     KeyCode::Char('d') => self.edit(|list, task| InputKind::Due { list, task }, list, task),
                     KeyCode::Char('m') => self.open_move(list, task),
+                    KeyCode::Char('s') => self.toggle_subtasks(&list, &task),
                     KeyCode::Char('a') | KeyCode::Char('o') | KeyCode::Char('n') => self.add_task(list, None),
                     KeyCode::Char('A') | KeyCode::Char('O') => self.add_subtask(list, &task),
                     KeyCode::Char('x') | KeyCode::Char('D') | KeyCode::Delete => self.ask_delete_task(list, task),

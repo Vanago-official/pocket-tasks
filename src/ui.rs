@@ -470,15 +470,29 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
     }
 
     let mut s = Seg::default();
-    s.text(format!(" {}", "   ".repeat(depth as usize)), Style::new());
+    // Top-level tasks carry a fold arrow when they have subtasks.
+    let subs = if depth == 0 { app.subtask_count(list, &t.id) } else { 0 };
+    let folded = app.st.collapsed_tasks.contains(&t.id);
+    if subs > 0 {
+        s.text(" ", Style::new()).click(
+            if folded { "▸ " } else { "▾ " },
+            Style::new().fg(ACCENT),
+            Some(Style::new().bold()),
+            Click::ToggleSubtasks(t.id.clone()),
+        );
+    } else {
+        s.text(format!("   {}", "   ".repeat(depth as usize)), Style::new());
+    }
     let (mark, style) = if t.done() { ("✔", Style::new().fg(GREEN)) } else { ("○", DIM) };
     let (l, id) = ids();
     s.click(format!("{mark} "), style, Some(Style::new().fg(ACCENT).bold()), Click::ToggleDone(l, id));
     let note = if t.notes.is_some() { " ≡" } else { "" };
-    let avail = w.saturating_sub((s.w + right.w) as usize + note.chars().count() + 1);
+    let hidden = if folded && subs > 0 { format!(" +{subs}") } else { String::new() };
+    let avail = w.saturating_sub((s.w + right.w) as usize + note.chars().count() + hidden.chars().count() + 1);
     let title_style = if t.done() { DIM.crossed_out() } else { Style::new() };
     s.text(truncate(&t.title, avail), title_style);
     s.text(note, DIM);
+    s.text(hidden, Style::new().fg(ACCENT));
     let pad = w.saturating_sub((s.w + right.w) as usize);
     s.text(" ".repeat(pad), Style::new());
     s.append(right);
@@ -779,6 +793,7 @@ fn draw_move(f: &mut Frame, app: &mut App, list: &str, task: &str, sel: usize) {
 fn draw_help(f: &mut Frame) {
     const KEYS: &[(&str, &str)] = &[
         ("Мишею", "кнопки, ○ — виконати, ▾ — згорнути"),
+        ("", "список чи підзавдання"),
         ("", "тягніть плитку за заголовок: на край"),
         ("", "іншої — ліворуч/праворуч, на середину —"),
         ("", "вище/нижче; подвійний клік — редагувати"),
@@ -793,6 +808,7 @@ fn draw_help(f: &mut Frame) {
         ("N", "новий список"),
         ("Space", "виконано / не виконано"),
         ("e  i  d", "назва · опис · дедлайн"),
+        ("s  ▾", "сховати / показати підзавдання"),
         ("m  ⇄", "перенести в інший список"),
         ("", "тягніть завдання: на інше — стане"),
         ("", "підзавданням, на плитку — окремим"),
@@ -969,7 +985,7 @@ mod tests {
         render(&mut app);
         // Drag "Купити молоко" (with its subtask) onto the "Покупки" tile.
         let row = hit(&app, Click::Select("a".into(), 1));
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 6, row.y, 1, 1));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 10, row.y, 1, 1));
         // Onto the "+ Додати завдання" row: a top-level task of that list.
         let add = hit(&app, Click::Select("c".into(), 2));
         let to = Rect::new(add.x + add.width / 2, add.y, 1, 1);
@@ -989,7 +1005,7 @@ mod tests {
         // Dropping back on its own tile does nothing.
         render(&mut app);
         let row = hit(&app, Click::Select("c".into(), 1));
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 6, row.y, 1, 1));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 10, row.y, 1, 1));
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), Rect::new(row.x + 8, row.y + 1, 1, 1));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), Rect::new(row.x + 8, row.y + 1, 1, 1));
         assert_eq!(app.st.pending.len(), 1);
@@ -1022,7 +1038,7 @@ mod tests {
     fn drag_task(app: &mut App, list: &str, row: usize, to: Rect) -> String {
         render(app);
         let from = hit(app, Click::Select(list.into(), row));
-        mouse(app, MouseEventKind::Down(MouseButton::Left), Rect::new(from.x + 6, from.y, 1, 1));
+        mouse(app, MouseEventKind::Down(MouseButton::Left), Rect::new(from.x + 10, from.y, 1, 1));
         mouse(app, MouseEventKind::Drag(MouseButton::Left), to);
         let screen = render(app);
         mouse(app, MouseEventKind::Up(MouseButton::Left), to);
@@ -1075,6 +1091,32 @@ mod tests {
         let screen = drag_task(&mut app, "a", row, Rect::new(add.x + 10, add.y, 1, 1));
         assert!(screen.contains("→ окреме завдання"), "{screen}");
         assert_eq!(parent_of(&app, "a", "3"), None);
+    }
+
+    #[test]
+    fn fold_subtasks() {
+        let mut app = sample();
+        app.sel = Sel { list: "a".into(), row: 2 }; // "Знежирене", subtask of "1"
+        let screen = render(&mut app);
+        assert!(screen.contains("▾ ○ Купи"), "{screen}");
+        press(&mut app, Click::ToggleSubtasks("1".into()));
+        let screen = render(&mut app);
+        println!("{screen}");
+        assert!(!screen.contains("Знежирене"));
+        assert!(screen.contains("▸ ○ Купи… +1"), "{screen}");
+        assert_eq!(app.selected_task().map(|t| t.id.as_str()), Some("1"), "selection moves to the parent");
+        assert!(app.st.collapsed_tasks.contains("1"));
+
+        // `s` unfolds again, from the parent or from a subtask.
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(render(&mut app).contains("Знежирене"));
+        app.sel = Sel { list: "a".into(), row: 2 };
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(!render(&mut app).contains("Знежирене"));
+        // Tasks without subtasks get no arrow and ignore `s`.
+        app.select_task_pub("a", "3");
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(!app.st.collapsed_tasks.contains("3"));
     }
 
     #[test]
