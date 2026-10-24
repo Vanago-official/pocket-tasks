@@ -5,7 +5,7 @@ use chrono::NaiveDate;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 // Catppuccin Mocha, explicit so the panel stays opaque over the translucent backdrop.
@@ -163,10 +163,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    if main.height >= 20 {
+    if main.height >= 20 && !app.st.hide_details {
         let [board, details] = Layout::vertical([Constraint::Min(5), Constraint::Length(7)]).areas(main);
         draw_board(f, app, board);
         draw_details(f, app, details);
+    } else if main.height >= 20 {
+        // Folded details: just the panel's top border, its title still the toggle.
+        let [board, bar] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(main);
+        draw_board(f, app, board);
+        f.render_widget(Block::new().borders(Borders::TOP).border_style(Style::new().fg(SURFACE1)), bar);
+        let what = if app.selected_task().is_some() { "Опис" } else { "Список" };
+        let mut s = details_toggle(what, true);
+        if let Some(t) = app.selected_task() {
+            s.text(format!(" {} ", truncate(&t.title, 60)), DIM);
+        }
+        place(f, app, bar.x + 1, bar.y, bar.width.saturating_sub(2), s);
     } else {
         draw_board(f, app, main);
     }
@@ -517,6 +528,15 @@ fn task_row(app: &App, list: &str, ti: usize, depth: u8, w: usize, active: bool)
     s
 }
 
+/// Line under the last tile of column `c`, where a dropped item lands.
+fn column_end_line(f: &mut Frame, app: &App, c: usize) {
+    let Some(col) = app.col_rects.iter().find(|(i, _)| *i == c).map(|(_, r)| *r) else { return };
+    let bottom = app.tile_rects.iter().filter(|(_, r)| r.x == col.x).map(|(_, r)| r.bottom()).max().unwrap_or(col.y);
+    let y = bottom.min(col.bottom() - 1);
+    let w = col.width.saturating_sub(1);
+    f.render_widget(Span::styled("━".repeat(w as usize), Style::new().fg(ACCENT).bold()), Rect::new(col.x, y, w, 1));
+}
+
 /// Drop indicator and a ghost label following the cursor while a tile is dragged.
 fn draw_drag(f: &mut Frame, app: &mut App) {
     let Some(d) = app.drag.as_ref().filter(|d| d.moved) else { return };
@@ -538,7 +558,13 @@ fn draw_drag(f: &mut Frame, app: &mut App) {
                         None => format!(" → {}", app.list(&d.list).map(|l| l.title.as_str()).unwrap_or("")),
                     },
                 },
-                None => " → на завдання чи іншу плитку".into(),
+                None => match app.new_list_target(pos) {
+                    Some(c) => {
+                        column_end_line(f, app, c);
+                        " → новий список".into()
+                    }
+                    None => " → на завдання, плитку чи порожнє місце".into(),
+                },
             };
             let n = app.group(list, task).len();
             let name = if n > 1 { format!("{n} завдань") } else { truncate(&name.unwrap_or_default(), 30) };
@@ -569,28 +595,31 @@ fn draw_drag(f: &mut Frame, app: &mut App) {
                 }
             }
         }
-        Some(Drop::ColumnEnd(c)) => {
-            let col = app.col_rects.iter().find(|(i, _)| *i == c).map(|(_, r)| *r);
-            if let Some(col) = col {
-                let bottom = app
-                    .tile_rects
-                    .iter()
-                    .filter(|(_, r)| r.x == col.x)
-                    .map(|(_, r)| r.bottom())
-                    .max()
-                    .unwrap_or(col.y);
-                let y = bottom.min(col.bottom() - 1);
-                let w = col.width.saturating_sub(1);
-                f.render_widget(Span::styled("━".repeat(w as usize), line), Rect::new(col.x, y, w, 1));
+        Some(Drop::ColumnEnd(c)) => column_end_line(f, app, c),
+        Some(Drop::Into(t)) => {
+            if let Some(r) = rect_of(&t) {
+                f.render_widget(Block::bordered().border_type(BorderType::Thick).border_style(line), r);
             }
         }
         None => {}
     }
-    let label = format!(" ⠿ {} ", truncate(&title, 30));
+    let into = match app.drop_target(pos) {
+        Some(Drop::Into(t)) => format!(" → завдання в «{}»", app.list(&t).map(|l| l.title.as_str()).unwrap_or("")),
+        _ => String::new(),
+    };
+    let label = format!(" ⠿ {}{into} ", truncate(&title, 30));
     let area = f.area();
     let w = (label.chars().count() as u16).min(area.width);
     let x = (pos.x + 1).min(area.right().saturating_sub(w));
     f.render_widget(Span::styled(label, BTN_HOVER.bold()), Rect::new(x, pos.y, w, 1));
+}
+
+/// "▾ Опис" on the details panel border: folds it, or unfolds it when `folded`.
+fn details_toggle(what: &str, folded: bool) -> Seg {
+    let mut s = Seg::default();
+    let arrow = if folded { "▸" } else { "▾" };
+    s.click(format!(" {arrow} {what} "), Style::new().fg(ACCENT), Some(BTN_HOVER), Click::ToggleDetails);
+    s
 }
 
 fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
@@ -638,10 +667,13 @@ fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(block(title, false).style(Style::new().bg(BASE)));
+        .block(block("", false).style(Style::new().bg(BASE)));
     f.render_widget(p, area);
+    let toggle = details_toggle(title.trim(), false);
+    let tw = toggle.w;
+    place(f, app, area.x + 1, area.y, tw, toggle);
     let bx = area.x + area.width.saturating_sub(btns.w + 2);
-    let min_x = area.x + title.chars().count() as u16 + 2;
+    let min_x = area.x + tw + 2;
     place(f, app, bx.max(min_x), area.y, area.right().saturating_sub(bx.max(min_x) + 1), btns);
 }
 
@@ -842,8 +874,13 @@ fn draw_help(f: &mut Frame) {
         ("Shift+клік", "вибрати проміжок; m, e і перетягування"),
         ("", "діють на всі вибрані; e: * — змінна"),
         ("", "частина назви, Esc — скинути вибір"),
+        ("", "Space, d, x — теж для всіх вибраних"),
+        ("", "завдання на порожнє місце — стане"),
+        ("", "списком; плитку на заголовок іншої —"),
+        ("", "завданням з підзавданнями"),
         ("x  Del", "видалити"),
         ("c / C", "показати виконані / видалити їх"),
+        ("I  ▾ ▸", "сховати / показати панель опису"),
         ("r", "синхронізувати зараз"),
         ("Ctrl+L", "увійти в Google знову"),
         ("q  Esc", "сховати (у кишеню)"),
@@ -981,9 +1018,9 @@ mod tests {
         assert_eq!(app.st.layout, vec![vec!["a", "c"], vec!["b"]]);
         println!("{}", render(&mut app));
 
-        // Middle-top of "Мої завдання": "Покупки" goes above it.
+        // Middle-top of "Мої завдання" (below its header): "Покупки" goes above it.
         let a = tile(&app, "a");
-        drag(&mut app, "c", Rect::new(a.x + a.width / 2, a.y, 1, 1));
+        drag(&mut app, "c", Rect::new(a.x + a.width / 2, a.y + 1, 1, 1));
         assert_eq!(app.st.layout, vec![vec!["c", "a"], vec!["b"]]);
 
         // Right edge of "Робота": a new column to its right.
@@ -1199,6 +1236,80 @@ mod tests {
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.marked.is_empty());
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn group_actions_apply_to_all_marked() {
+        let mut app = sample();
+        app.st.show_completed = true; // keep done tasks on screen and selectable
+        app.marked = vec!["1".into(), "3".into(), "5".into()];
+        let key = |app: &mut App, c: char| {
+            app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char(c), KeyModifiers::NONE))
+        };
+        app.select_task_pub("a", "3");
+        key(&mut app, ' ');
+        assert!(["1", "3"].iter().all(|id| app.list_tasks("a").iter().any(|t| t.id == *id && t.done())));
+        assert!(app.list_tasks("c")[0].done());
+        key(&mut app, ' ');
+        assert!(app.list_tasks("a").iter().all(|t| !t.done()), "all done -> all undone");
+
+        key(&mut app, 'd');
+        let Mode::Input { kind, .. } = std::mem::replace(&mut app.mode, Mode::Normal) else { panic!() };
+        app.mode = Mode::Input { kind, ed: crate::app::Editor::new("+2") };
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.list_tasks("c")[0].due.is_some() && app.list_tasks("a")[0].due.is_some());
+
+        key(&mut app, 'x');
+        assert!(matches!(&app.mode, Mode::Confirm { msg, .. } if msg.contains("(3)")));
+        key(&mut app, 'y');
+        assert!(app.list_tasks("a").is_empty(), "parent took its subtask along");
+        assert!(app.list_tasks("c").is_empty());
+        assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn task_to_list_and_back() {
+        let mut app = sample();
+        app.st.tasks.get_mut("a").unwrap()[1].notes = Some("1%".into());
+        render(&mut app);
+        // Drop "Купити молоко" on empty board space: a list with "Знежирене" in it.
+        let col = app.col_rects[0].1;
+        let empty = Rect::new(col.x + 3, col.bottom() - 2, 1, 1);
+        let screen = drag_task(&mut app, "a", 1, empty);
+        assert!(screen.contains("→ новий список"), "{screen}");
+        let new = app.st.lists.iter().find(|l| l.title == "Купити молоко").expect("new list").id.clone();
+        assert_eq!(app.list_tasks(&new).iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["Знежирене"]);
+        assert_eq!(app.list_tasks(&new)[0].notes.as_deref(), Some("1%"));
+        assert_eq!(app.list_tasks("a").iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["3"]);
+        assert!(matches!(app.st.pending[0], Op::CreateList { .. }));
+        assert!(app.st.pending.iter().any(|op| matches!(op, Op::DeleteTask { task, .. } if task == "1")));
+
+        // And back: drag the "Покупки" tile onto the header of "Мої завдання".
+        render(&mut app);
+        let target = tile(&app, "a");
+        drag(&mut app, "c", Rect::new(target.x + target.width / 2, target.y, 1, 1));
+        assert!(matches!(&app.mode, Mode::Confirm { what: crate::app::Confirm::ListToTask { .. }, .. }));
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.list("c").is_none());
+        let parent = app.list_tasks("a").iter().find(|t| t.title == "Покупки").unwrap().id.clone();
+        let bread = app.list_tasks("a").iter().find(|t| t.title == "Хліб").unwrap();
+        assert_eq!(bread.parent.as_deref(), Some(parent.as_str()));
+        assert!(app.st.pending.iter().any(|op| matches!(op, Op::DeleteList { list } if list == "c")));
+    }
+
+    #[test]
+    fn hide_details_panel() {
+        let mut app = sample();
+        app.select_task_pub("a", "3");
+        assert!(render(&mut app).contains("▾ Опис"));
+        press(&mut app, Click::ToggleDetails);
+        assert!(app.st.hide_details);
+        let screen = render(&mut app);
+        assert!(!screen.contains("Без опису") && screen.contains("▸ Опис  Подзвонити"), "{screen}");
+        // Both toggles sit at the same spot.
+        assert_eq!(hit(&app, Click::ToggleDetails).x, app.panel.x + 2);
+        press(&mut app, Click::ToggleDetails);
+        assert!(!app.st.hide_details, "the folded bar brings it back");
     }
 
     #[test]

@@ -104,6 +104,9 @@ pub struct State {
     pub pending: Vec<Op>,
     #[serde(default)]
     pub show_completed: bool,
+    /// The details panel under the board is hidden.
+    #[serde(default)]
+    pub hide_details: bool,
     /// Lists folded in the tree view; kept across restarts.
     #[serde(default)]
     pub collapsed: HashSet<String>,

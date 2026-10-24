@@ -41,6 +41,8 @@ pub enum Drop {
     LeftOf(String),
     RightOf(String),
     ColumnEnd(usize),
+    /// Onto another tile's header: the dragged list becomes a task of that list.
+    Into(String),
 }
 
 /// What is being dragged: a whole tile, or one task on its way to another list.
@@ -91,6 +93,7 @@ pub enum Click {
     ExpandAll(bool),
     ColScroll(usize, i32),
     ToggleCompleted,
+    ToggleDetails,
     Refresh,
     Login,
     Help,
@@ -123,7 +126,9 @@ impl InputKind {
 
 pub enum Confirm {
     DeleteTask { list: String, task: String },
+    DeleteTasks { tasks: Vec<(String, String)> },
     DeleteList { list: String },
+    ListToTask { list: String, dest: String },
     DeleteCompleted { list: String },
 }
 
@@ -614,7 +619,9 @@ impl App {
             }
             let edge = (r.width / 4).max(3);
             let (dx, dy) = (pos.x - r.x, pos.y - r.y);
-            return Some(if dx < edge {
+            return Some(if dy == 0 && dx >= edge && dx < r.width.saturating_sub(edge) {
+                Drop::Into(id.clone())
+            } else if dx < edge {
                 Drop::LeftOf(id.clone())
             } else if dx >= r.width.saturating_sub(edge) {
                 Drop::RightOf(id.clone())
@@ -674,6 +681,128 @@ impl App {
             return;
         }
         self.mode = Mode::MoveTo { list, task, sel: 0 };
+    }
+
+    /// Column whose empty space a dragged task is over: dropping it there makes it a list.
+    pub fn new_list_target(&self, pos: Position) -> Option<usize> {
+        let Some(DragItem::Task { .. }) = self.drag.as_ref().map(|d| &d.item) else { return None };
+        if self.tile_rects.iter().any(|(_, r)| r.contains(pos)) {
+            return None;
+        }
+        self.col_rects.iter().find(|(_, r)| r.contains(pos)).map(|(c, _)| *c)
+    }
+
+    /// Turns `task` (or each marked top-level task with it) into a list; subtasks become
+    /// its tasks. The new lists go to the end of column `col`.
+    fn tasks_to_lists(&mut self, list: &str, task: &str, col: usize) {
+        let group = self.group(list, task);
+        let ids: HashSet<String> = group.iter().map(|(_, t)| t.clone()).collect();
+        let mut made = 0;
+        let mut last = None;
+        for (l, id) in group {
+            let Some(t) = self.list_tasks(&l).iter().find(|t| t.id == id).cloned() else { continue };
+            if t.parent.as_deref().is_some_and(|p| ids.contains(p)) {
+                continue; // goes along with its marked parent
+            }
+            let new_list = self.tmp_id();
+            self.st.lists.push(TaskList { id: new_list.clone(), title: t.title.clone() });
+            self.push(Op::CreateList { tmp: new_list.clone(), title: t.title.clone() });
+            // Subtasks in shown order; created at the top one after another, so reversed.
+            let rows: Vec<Task> = self
+                .task_rows(&l)
+                .into_iter()
+                .map(|(i, _)| self.list_tasks(&l)[i].clone())
+                .filter(|c| c.parent.as_deref() == Some(&id))
+                .collect();
+            let mut hidden: Vec<Task> =
+                self.list_tasks(&l).iter().filter(|c| c.parent.as_deref() == Some(&id)).cloned().collect();
+            hidden.retain(|c| !rows.iter().any(|r| r.id == c.id));
+            for c in rows.into_iter().chain(hidden).rev() {
+                let tmp = self.tmp_id();
+                self.push(Op::CreateTask { list: new_list.clone(), tmp: tmp.clone(), parent: None, title: c.title.clone() });
+                let mut patch = serde_json::Map::new();
+                if c.notes.is_some() {
+                    patch.insert("notes".into(), json!(c.notes));
+                }
+                if c.due.is_some() {
+                    patch.insert("due".into(), json!(c.due));
+                }
+                if c.done() {
+                    patch.insert("status".into(), json!("completed"));
+                }
+                if !patch.is_empty() {
+                    self.push(Op::PatchTask { list: new_list.clone(), task: tmp.clone(), patch: Value::Object(patch) });
+                }
+                self.st.tasks.entry(new_list.clone()).or_default().insert(0, Task { id: tmp, parent: None, ..c });
+            }
+            self.st.tasks.entry(new_list.clone()).or_default();
+            self.delete_task(&l, &id);
+            match self.st.layout.get_mut(col) {
+                Some(c) => c.push(new_list.clone()),
+                None => self.st.layout.push(vec![new_list.clone()]),
+            }
+            made += 1;
+            last = Some(new_list);
+        }
+        self.marked.clear();
+        self.dirty = true;
+        self.normalize_layout();
+        if let Some(l) = last {
+            self.select(&l, 0);
+        }
+        self.flash(format!("Нових списків: {made}"), false);
+    }
+
+    fn ask_list_to_task(&mut self, list: String, dest: String) {
+        let (Some(l), Some(d)) = (self.list(&list), self.list(&dest)) else { return };
+        let n = self.list_tasks(&list).len();
+        self.mode = Mode::Confirm {
+            msg: format!("Перетворити список «{}» на завдання в «{}»? Його завдання ({n}) стануть підзавданнями.", l.title, d.title),
+            what: Confirm::ListToTask { list, dest },
+        };
+    }
+
+    /// The list becomes a task of `dest`; all its tasks (subtasks too, Google nests only
+    /// one level) become that task's subtasks, keeping notes, deadlines and status.
+    fn list_to_task(&mut self, list: &str, dest: &str) {
+        let Some(title) = self.list(list).map(|l| l.title.clone()) else { return };
+        if self.list(dest).is_none() || list == dest {
+            return;
+        }
+        let parent = self.tmp_id();
+        self.st.tasks.entry(dest.to_string()).or_default().push(Task {
+            id: parent.clone(),
+            title: title.clone(),
+            status: "needsAction".into(),
+            ..Default::default()
+        });
+        self.push(Op::CreateTask { list: dest.into(), tmp: parent.clone(), parent: None, title });
+        // Shown order, done ones included; Google puts each moved task first, so go
+        // backwards, which also moves every subtask before its own parent.
+        let show = std::mem::replace(&mut self.st.show_completed, true);
+        let order: Vec<String> = self.task_rows(list).into_iter().map(|(i, _)| self.list_tasks(list)[i].id.clone()).collect();
+        self.st.show_completed = show;
+        let mut rest: Vec<String> = self.list_tasks(list).iter().map(|t| t.id.clone()).filter(|id| !order.contains(id)).collect();
+        rest.extend(order);
+        let moved = self.st.tasks.remove(list).unwrap_or_default();
+        for id in rest.iter().rev() {
+            self.push(Op::MoveTask { list: list.into(), task: id.clone(), dest: dest.into(), parent: Some(parent.clone()) });
+        }
+        let dest_tasks = self.st.tasks.entry(dest.to_string()).or_default();
+        for id in &rest {
+            if let Some(t) = moved.iter().find(|t| t.id == *id) {
+                dest_tasks.push(Task { parent: Some(parent.clone()), position: String::new(), ..t.clone() });
+            }
+        }
+        self.st.lists.retain(|l| l.id != list);
+        self.st.collapsed.remove(list);
+        self.push(Op::DeleteList { list: list.into() });
+        self.normalize_layout();
+        self.st.collapsed_tasks.insert(parent.clone());
+        self.flash("Список став завданням", false);
+        if !self.select_task(dest, &parent) {
+            self.select(dest, 0);
+        }
     }
 
     fn list_of(&self, task: &str) -> Option<String> {
@@ -840,6 +969,8 @@ impl App {
                 Some(col) => col.push(id),
                 None => layout.push(vec![id]),
             },
+            // Handled by `ask_list_to_task`; keep the tile where it was dropped from.
+            Drop::Into(_) => layout[0].push(id),
         }
         layout.retain(|c| !c.is_empty());
         self.dirty = true;
@@ -1099,6 +1230,14 @@ impl App {
     }
 
     fn ask_delete_task(&mut self, list: String, task: String) {
+        let group = self.group(&list, &task);
+        if group.len() > 1 {
+            self.mode = Mode::Confirm {
+                msg: format!("Видалити вибрані завдання ({})?", group.len()),
+                what: Confirm::DeleteTasks { tasks: group },
+            };
+            return;
+        }
         let Some(t) = self.list_tasks(&list).iter().find(|t| t.id == task) else { return };
         self.mode = Mode::Confirm { msg: format!("Видалити «{}»?", t.title), what: Confirm::DeleteTask { list, task } };
     }
@@ -1131,9 +1270,25 @@ impl App {
         }
     }
 
+    /// Marks `id` done or not; for a marked group all follow: done unless all already are.
     fn toggle_done(&mut self, list: String, id: String) {
+        let group = self.group(&list, &id);
+        if group.len() < 2 {
+            return self.set_done(list, id, None);
+        }
+        let all_done = group.iter().all(|(l, t)| self.list_tasks(l).iter().any(|x| x.id == *t && x.done()));
+        for (l, t) in group {
+            self.set_done(l, t, Some(!all_done));
+        }
+    }
+
+    fn set_done(&mut self, list: String, id: String, done: Option<bool>) {
         let Some(t) = self.task_mut(&list, &id) else { return };
-        let patch = if t.done() {
+        let done = done.unwrap_or(!t.done());
+        if done == t.done() {
+            return;
+        }
+        let patch = if !done {
             t.status = "needsAction".into();
             t.completed = None;
             json!({ "status": "needsAction", "completed": null })
@@ -1144,6 +1299,11 @@ impl App {
         };
         self.push(Op::PatchTask { list, task: id, patch });
         self.clamp();
+    }
+
+    fn toggle_details(&mut self) {
+        self.st.hide_details = !self.st.hide_details;
+        self.dirty = true;
     }
 
     fn toggle_completed(&mut self) {
@@ -1228,10 +1388,12 @@ impl App {
             InputKind::Due { list, task } => match date::parse_input(&text, date::today()) {
                 Ok(d) => {
                     let due = d.map(date::to_api);
-                    if let Some(t) = self.task_mut(&list, &task) {
-                        t.due = due.clone();
+                    for (list, task) in self.group(&list, &task) {
+                        if let Some(t) = self.task_mut(&list, &task) {
+                            t.due = due.clone();
+                        }
+                        self.patch(list, task, json!({ "due": due.clone() }));
                     }
-                    self.patch(list, task, json!({ "due": due }));
                 }
                 Err(e) => self.flash(e, true),
             },
@@ -1261,6 +1423,16 @@ impl App {
     fn confirm(&mut self, what: Confirm) {
         match what {
             Confirm::DeleteTask { list, task } => self.delete_task(&list, &task),
+            Confirm::DeleteTasks { tasks } => {
+                for (list, task) in tasks {
+                    // A subtask may already be gone with its parent.
+                    if self.list_tasks(&list).iter().any(|t| t.id == task) {
+                        self.delete_task(&list, &task);
+                    }
+                }
+                self.marked.clear();
+            }
+            Confirm::ListToTask { list, dest } => self.list_to_task(&list, &dest),
             Confirm::DeleteList { list } => {
                 self.st.lists.retain(|l| l.id != list);
                 self.st.tasks.remove(&list);
@@ -1360,18 +1532,21 @@ impl App {
                 if let Some(d) = self.drag.take() {
                     let moved = d.moved;
                     self.drag = Some(Drag { pos, ..d });
-                    let (tile_target, task_target) = (self.drop_target(pos), self.task_drop_target(pos));
+                    let (tile_target, task_target, list_target) =
+                        (self.drop_target(pos), self.task_drop_target(pos), self.new_list_target(pos));
                     let d = self.drag.take().unwrap();
                     match d.item {
                         DragItem::Tile(list) if !moved => self.on_click(Click::Select(list, 0)),
-                        DragItem::Tile(list) => {
-                            if let Some(t) = tile_target {
-                                self.apply_drop(&list, t);
-                            }
-                        }
+                        DragItem::Tile(list) => match tile_target {
+                            Some(Drop::Into(dest)) => self.ask_list_to_task(list, dest),
+                            Some(t) => self.apply_drop(&list, t),
+                            None => {}
+                        },
                         DragItem::Task { list, task } if moved && matches!(self.mode, Mode::Normal) => {
                             if let Some(TaskDrop { list: dest, parent }) = task_target {
                                 self.move_group(&list, &task, &dest, parent);
+                            } else if let Some(col) = list_target {
+                                self.tasks_to_lists(&list, &task, col);
                             }
                         }
                         DragItem::Task { .. } => {}
@@ -1458,6 +1633,7 @@ impl App {
                 }
             }
             Click::ToggleCompleted => self.toggle_completed(),
+            Click::ToggleDetails => self.toggle_details(),
             Click::Refresh => self.refresh_now(),
             Click::Login => self.login_requested = true,
             Click::Help => self.mode = Mode::Help,
@@ -1557,6 +1733,7 @@ impl App {
             KeyCode::Char('?') | KeyCode::F(1) => return self.mode = Mode::Help,
             KeyCode::Char('r') => return self.refresh_now(),
             KeyCode::Char('c') => return self.toggle_completed(),
+            KeyCode::Char('I') => return self.toggle_details(),
             KeyCode::Char('N') => return self.open_input(InputKind::NewList, ""),
             KeyCode::Char('z') => return self.expand_all(false),
             KeyCode::Char('Z') => return self.expand_all(true),
