@@ -157,10 +157,18 @@ impl Api {
         self.req("PATCH", &format!("{}/{task}", tasks_url(list)), Some(patch)).map(drop)
     }
 
-    /// Google keeps the task id and moves its subtasks along.
-    pub fn move_task(&mut self, list: &str, task: &str, dest: &str) -> Result<(), ApiError> {
+    /// Google keeps the task id and moves its subtasks along; no `parent` means top level.
+    pub fn move_task(&mut self, list: &str, task: &str, dest: &str, parent: Option<&str>) -> Result<(), ApiError> {
         let mut u = url::Url::parse(&format!("{}/{task}/move", tasks_url(list))).expect("valid url");
-        u.query_pairs_mut().append_pair("destinationTasklist", dest);
+        {
+            let mut q = u.query_pairs_mut();
+            if dest != list {
+                q.append_pair("destinationTasklist", dest);
+            }
+            if let Some(p) = parent {
+                q.append_pair("parent", p);
+            }
+        }
         self.req("POST", u.as_str(), None).map(drop)
     }
 

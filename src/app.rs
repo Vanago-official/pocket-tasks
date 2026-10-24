@@ -49,6 +49,13 @@ pub enum DragItem {
     Task { list: String, task: String },
 }
 
+/// Destination of a dragged task: a list, and the task it becomes a subtask of.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TaskDrop {
+    pub list: String,
+    pub parent: Option<String>,
+}
+
 pub struct Drag {
     pub item: DragItem,
     pub from: Position,
@@ -237,8 +244,8 @@ pub struct App {
     pub modal_from: usize,
     pub hover: Option<Position>,
     pub drag: Option<Drag>,
-    /// Tile a dragged task would land in, worked out from the previous frame.
-    pub task_drop: Option<String>,
+    /// Where a dragged task would land, worked out from the previous frame.
+    pub task_drop: Option<TaskDrop>,
     pub busy: bool,
     pub net_error: Option<String>,
     pub auth_error: Option<String>,
@@ -569,10 +576,40 @@ impl App {
         self.col_rects.iter().find(|(_, r)| r.contains(pos)).map(|(c, _)| Drop::ColumnEnd(*c))
     }
 
-    /// The tile a dragged task would move into (any list other than its own).
-    pub fn task_drop_list(&self, pos: Position) -> Option<String> {
-        let Some(DragItem::Task { list, .. }) = self.drag.as_ref().map(|d| &d.item) else { return None };
-        self.tile_rects.iter().find(|(id, r)| r.contains(pos) && id != list).map(|(id, _)| id.clone())
+    /// Where a dragged task would land: onto a task it becomes that task's subtask
+    /// (Google allows one level, so onto a subtask means its parent), onto the rest of
+    /// a tile it becomes a top-level task of that list.
+    pub fn task_drop_target(&self, pos: Position) -> Option<TaskDrop> {
+        let Some(DragItem::Task { list, task }) = self.drag.as_ref().map(|d| &d.item) else { return None };
+        let row_hit = self.hits.iter().rev().find_map(|(r, c)| match c {
+            Click::Select(l, row) if r.contains(pos) => Some((l.clone(), *row)),
+            _ => None,
+        });
+        let target = match row_hit {
+            Some((l, row)) => {
+                let parent = match self.tile_rows(&l).get(row) {
+                    Some(TileRow::Task { task: ti, .. }) => {
+                        let t = &self.list_tasks(&l)[*ti];
+                        Some(t.parent.clone().unwrap_or_else(|| t.id.clone()))
+                    }
+                    _ => None,
+                };
+                TaskDrop { list: l, parent }
+            }
+            None => {
+                let (l, _) = self.tile_rects.iter().find(|(_, r)| r.contains(pos))?;
+                TaskDrop { list: l.clone(), parent: None }
+            }
+        };
+        let current = self.list_tasks(list).iter().find(|t| t.id == *task)?.parent.clone();
+        let unchanged = target.list == *list && target.parent == current;
+        (!unchanged && target.parent.as_deref() != Some(task)).then_some(target)
+    }
+
+    /// Why a task cannot be nested, if it cannot.
+    pub fn nest_blocker(&self, list: &str, task: &str, parent: Option<&str>) -> Option<&'static str> {
+        let has_children = self.list_tasks(list).iter().any(|t| t.parent.as_deref() == Some(task));
+        (parent.is_some() && has_children).then_some("завдання з підзавданнями не можна вкласти")
     }
 
     /// Lists a task can move to, in board order.
@@ -588,8 +625,33 @@ impl App {
         self.mode = Mode::MoveTo { list, task, sel: 0 };
     }
 
-    fn move_task(&mut self, list: &str, id: &str, dest: &str) {
-        if list == dest || self.list(dest).is_none() {
+    fn move_task(&mut self, list: &str, id: &str, dest: &str, parent: Option<String>) {
+        if self.list(dest).is_none() {
+            return;
+        }
+        if let Some(why) = self.nest_blocker(list, id, parent.as_deref()) {
+            self.flash(format!("Не можна: {why}"), true);
+            return;
+        }
+        let parent_title = parent
+            .as_deref()
+            .and_then(|p| self.list_tasks(dest).iter().find(|t| t.id == p))
+            .map(|t| t.title.clone());
+        let msg = match &parent_title {
+            Some(p) => format!("Тепер підзавдання «{p}»"),
+            None if list == dest => "Тепер окреме завдання".to_string(),
+            None => format!("Перенесено в «{}»", self.list(dest).map(|l| l.title.as_str()).unwrap_or("")),
+        };
+        if list == dest {
+            let Some(t) = self.task_mut(list, id) else { return };
+            if t.parent == parent {
+                return;
+            }
+            t.parent = parent.clone();
+            t.position = String::new();
+            self.push(Op::MoveTask { list: list.into(), task: id.into(), dest: dest.into(), parent });
+            self.flash(msg, false);
+            self.select_task(dest, id);
             return;
         }
         let Some(src) = self.st.tasks.get_mut(list) else { return };
@@ -602,14 +664,13 @@ impl App {
         }
         for t in &mut moved {
             if t.id == id {
-                t.parent = None;
+                t.parent = parent.clone();
                 t.position = String::new();
             }
         }
         self.st.tasks.entry(dest.to_string()).or_default().extend(moved);
-        self.push(Op::MoveTask { list: list.into(), task: id.into(), dest: dest.into() });
-        let name = self.list(dest).map(|l| l.title.clone()).unwrap_or_default();
-        self.flash(format!("Перенесено в «{name}»"), false);
+        self.push(Op::MoveTask { list: list.into(), task: id.into(), dest: dest.into(), parent });
+        self.flash(msg, false);
         if !self.select_task(dest, id) {
             self.select(dest, 0);
         }
@@ -1069,7 +1130,7 @@ impl App {
                 if let Some(d) = self.drag.take() {
                     let moved = d.moved;
                     self.drag = Some(Drag { pos, ..d });
-                    let (tile_target, task_target) = (self.drop_target(pos), self.task_drop_list(pos));
+                    let (tile_target, task_target) = (self.drop_target(pos), self.task_drop_target(pos));
                     let d = self.drag.take().unwrap();
                     match d.item {
                         DragItem::Tile(list) if !moved => self.on_click(Click::Select(list, 0)),
@@ -1079,8 +1140,8 @@ impl App {
                             }
                         }
                         DragItem::Task { list, task } if moved && matches!(self.mode, Mode::Normal) => {
-                            if let Some(dest) = task_target {
-                                self.move_task(&list, &task, &dest);
+                            if let Some(TaskDrop { list: dest, parent }) = task_target {
+                                self.move_task(&list, &task, &dest, parent);
                             }
                         }
                         DragItem::Task { .. } => {}
@@ -1145,7 +1206,7 @@ impl App {
             Click::MoveTask(l, t) => self.open_move(l, t),
             Click::MoveTo(dest) => {
                 if let Mode::MoveTo { list, task, .. } = std::mem::replace(&mut self.mode, Mode::Normal) {
-                    self.move_task(&list, &task, &dest);
+                    self.move_task(&list, &task, &dest, None);
                 }
             }
             Click::DeleteCompleted(l) => self.ask_delete_completed(l),
@@ -1206,11 +1267,11 @@ impl App {
                     KeyCode::Esc | KeyCode::Char('q') => {}
                     KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => {
                         if let Some(dest) = targets.get(sel) {
-                            self.move_task(&list, &task, dest);
+                            self.move_task(&list, &task, dest, None);
                         }
                     }
                     KeyCode::Char(c @ '1'..='9') => match targets.get(c as usize - '1' as usize) {
-                        Some(dest) => self.move_task(&list, &task, dest),
+                        Some(dest) => self.move_task(&list, &task, dest, None),
                         None => self.mode = Mode::MoveTo { list, task, sel },
                     },
                     KeyCode::Char('j') | KeyCode::Down => self.mode = Mode::MoveTo { list, task, sel: (sel + 1) % n },

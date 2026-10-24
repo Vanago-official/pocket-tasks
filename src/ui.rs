@@ -139,7 +139,7 @@ fn panel_rect(area: Rect, pocket: bool) -> Rect {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    app.task_drop = app.drag.as_ref().filter(|d| d.moved).and_then(|d| app.task_drop_list(d.pos));
+    app.task_drop = app.drag.as_ref().filter(|d| d.moved).and_then(|d| app.task_drop_target(d.pos));
     app.hits.clear();
     app.tile_rects.clear();
     app.col_rects.clear();
@@ -327,7 +327,9 @@ fn draw_tile(f: &mut Frame, app: &mut App, id: &str, r: Rect) {
     let Some(list) = app.list(id).cloned() else { return };
     let selected = app.sel.list == id;
     let dragging = app.drag.as_ref().is_some_and(|d| d.moved && d.item == DragItem::Tile(id.to_string()));
-    let task_target = app.task_drop.as_deref() == Some(id);
+    // Thick border when a dragged task would land in this tile as a top-level task.
+    let task_target = app.task_drop.as_ref().is_some_and(|d| d.list == id && d.parent.is_none());
+    let nest_target = app.task_drop.as_ref().filter(|d| d.list == id).and_then(|d| d.parent.clone());
     let tile_hover = hovered(app, r);
     let border = if task_target {
         ACCENT
@@ -420,7 +422,11 @@ fn draw_tile(f: &mut Frame, app: &mut App, id: &str, r: Rect) {
         let row_idx = vi + 1;
         let sel_row = selected && app.sel.row == row_idx;
         let active = sel_row || hovered(app, row_rect);
-        if sel_row {
+        let is_nest_target = matches!(*row, TileRow::Task { task, .. }
+            if nest_target.as_deref() == Some(app.list_tasks(id)[task].id.as_str()));
+        if is_nest_target {
+            f.render_widget(Block::new().bg(SURFACE1), row_rect);
+        } else if sel_row {
             f.render_widget(Block::new().bg(SELECTED_BG), row_rect);
         }
         app.hits.push((row_rect, Click::Select(id.to_string(), row_idx)));
@@ -489,8 +495,18 @@ fn draw_drag(f: &mut Frame, app: &mut App) {
             // Moving a task: the target tile is highlighted while drawing; only the ghost here.
             let name = app.list_tasks(list).iter().find(|t| t.id == *task).map(|t| t.title.clone());
             let to = match &app.task_drop {
-                Some(dest) => format!(" → {}", app.list(dest).map(|l| l.title.as_str()).unwrap_or("")),
-                None => " → перетягніть на інший список".into(),
+                Some(d) => match app.nest_blocker(list, task, d.parent.as_deref()) {
+                    Some(why) => format!(" ✕ {why}"),
+                    None => match d.parent.as_deref() {
+                        Some(p) => {
+                            let p = app.list_tasks(&d.list).iter().find(|t| t.id == p).map(|t| t.title.clone());
+                            format!(" → підзавдання «{}»", truncate(&p.unwrap_or_default(), 24))
+                        }
+                        None if d.list == *list => " → окреме завдання".into(),
+                        None => format!(" → {}", app.list(&d.list).map(|l| l.title.as_str()).unwrap_or("")),
+                    },
+                },
+                None => " → на завдання чи іншу плитку".into(),
             };
             let label = format!(" ⠿ {}{to} ", truncate(&name.unwrap_or_default(), 30));
             let area = f.area();
@@ -777,8 +793,9 @@ fn draw_help(f: &mut Frame) {
         ("N", "новий список"),
         ("Space", "виконано / не виконано"),
         ("e  i  d", "назва · опис · дедлайн"),
-        ("m  ⇄", "перенести в інший список (або тягніть"),
-        ("", "завдання мишею на іншу плитку)"),
+        ("m  ⇄", "перенести в інший список"),
+        ("", "тягніть завдання: на інше — стане"),
+        ("", "підзавданням, на плитку — окремим"),
         ("x  Del", "видалити"),
         ("c / C", "показати виконані / видалити їх"),
         ("r", "синхронізувати зараз"),
@@ -953,19 +970,20 @@ mod tests {
         // Drag "Купити молоко" (with its subtask) onto the "Покупки" tile.
         let row = hit(&app, Click::Select("a".into(), 1));
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), Rect::new(row.x + 6, row.y, 1, 1));
-        let c = tile(&app, "c");
-        let to = Rect::new(c.x + c.width / 2, c.y + 1, 1, 1);
+        // Onto the "+ Додати завдання" row: a top-level task of that list.
+        let add = hit(&app, Click::Select("c".into(), 2));
+        let to = Rect::new(add.x + add.width / 2, add.y, 1, 1);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to);
         let screen = render(&mut app);
         println!("{screen}");
-        assert_eq!(app.task_drop.as_deref(), Some("c"));
+        assert_eq!(app.task_drop, Some(crate::app::TaskDrop { list: "c".into(), parent: None }));
         assert!(screen.contains("→ Покупки"));
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), to);
         let ids = |app: &App, l: &str| app.list_tasks(l).iter().map(|t| t.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&app, "a"), ["3"]);
         assert_eq!(ids(&app, "c"), ["5", "1", "2"]);
         assert_eq!(app.list_tasks("c")[2].parent.as_deref(), Some("1"));
-        assert!(matches!(&app.st.pending[0], Op::MoveTask { list, task, dest } if list == "a" && task == "1" && dest == "c"));
+        assert!(matches!(&app.st.pending[0], Op::MoveTask { list, task, dest, parent: None } if list == "a" && task == "1" && dest == "c"));
         assert_eq!(app.selected_task().map(|t| t.id.as_str()), Some("1"));
 
         // Dropping back on its own tile does nothing.
@@ -999,6 +1017,64 @@ mod tests {
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('m'), KeyModifiers::NONE));
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(app.list_tasks("a").iter().any(|t| t.id == "2"));
+    }
+
+    fn drag_task(app: &mut App, list: &str, row: usize, to: Rect) -> String {
+        render(app);
+        let from = hit(app, Click::Select(list.into(), row));
+        mouse(app, MouseEventKind::Down(MouseButton::Left), Rect::new(from.x + 6, from.y, 1, 1));
+        mouse(app, MouseEventKind::Drag(MouseButton::Left), to);
+        let screen = render(app);
+        mouse(app, MouseEventKind::Up(MouseButton::Left), to);
+        screen
+    }
+
+    fn parent_of<'a>(app: &'a App, list: &str, id: &str) -> Option<&'a str> {
+        app.list_tasks(list).iter().find(|t| t.id == id).and_then(|t| t.parent.as_deref())
+    }
+
+    #[test]
+    fn drop_task_on_task_nests_it() {
+        let mut app = sample();
+        render(&mut app);
+        // "Подзвонити" (row 3) onto "Купити молоко" (row 1) in the same list.
+        let target = hit(&app, Click::Select("a".into(), 1));
+        let screen = drag_task(&mut app, "a", 3, Rect::new(target.x + 10, target.y, 1, 1));
+        assert!(screen.contains("→ підзавдання «Купити молоко»"), "{screen}");
+        assert_eq!(parent_of(&app, "a", "3"), Some("1"));
+        assert!(matches!(&app.st.pending[0],
+            Op::MoveTask { list, task, dest, parent: Some(p) } if list == "a" && task == "3" && dest == "a" && p == "1"));
+
+        // Onto a subtask ("Знежирене", parent "1"): lands under that subtask's parent.
+        let rows = app.tile_rows("c");
+        assert_eq!(rows.len(), 3);
+        render(&mut app);
+        let sub = hit(&app, Click::Select("a".into(), 2));
+        drag_task(&mut app, "c", 1, Rect::new(sub.x + 10, sub.y, 1, 1));
+        assert_eq!(parent_of(&app, "a", "5"), Some("1"), "cross-list nesting");
+        assert!(app.list_tasks("c").is_empty());
+
+        // A task that has subtasks cannot be nested.
+        app.st.collapsed.clear();
+        render(&mut app);
+        let other = hit(&app, Click::Select("b".into(), 1));
+        let screen = drag_task(&mut app, "a", 1, Rect::new(other.x + 10, other.y, 1, 1));
+        assert!(screen.contains("✕ завдання з підзавданнями не можна вкласти"), "{screen}");
+        assert_eq!(parent_of(&app, "b", "1"), None);
+        assert!(app.list_tasks("a").iter().any(|t| t.id == "1"));
+
+        // A subtask dropped on the rest of its own tile becomes a top-level task again.
+        render(&mut app);
+        let add = app
+            .hits
+            .iter()
+            .find(|(_, c)| matches!(c, Click::Select(l, r) if l == "a" && app.tile_rows("a").get(*r) == Some(&TileRow::Add)))
+            .unwrap()
+            .0;
+        let row = app.tile_rows("a").iter().position(|r| matches!(r, TileRow::Task { task, .. } if app.list_tasks("a")[*task].id == "3")).unwrap();
+        let screen = drag_task(&mut app, "a", row, Rect::new(add.x + 10, add.y, 1, 1));
+        assert!(screen.contains("→ окреме завдання"), "{screen}");
+        assert_eq!(parent_of(&app, "a", "3"), None);
     }
 
     #[test]
