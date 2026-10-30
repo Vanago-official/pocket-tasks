@@ -94,6 +94,7 @@ pub enum Click {
     ColScroll(usize, i32),
     ToggleCompleted,
     ToggleDetails,
+    OpenUrl(String),
     Refresh,
     Login,
     Help,
@@ -230,6 +231,43 @@ impl Editor {
 }
 
 /// Lets hotkeys work while the Ukrainian layout is active.
+/// Web links (http/https) in `text` as byte ranges, without trailing punctuation.
+pub fn find_urls(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(off) = text[i..].find("http") {
+        let start = i + off;
+        let rest = &text[start..];
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            0
+        };
+        let glued = text[..start].chars().next_back().is_some_and(|c| c.is_alphanumeric());
+        if scheme == 0 || glued {
+            i = start + 4;
+            continue;
+        }
+        let mut end = start + rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"')).unwrap_or(rest.len());
+        while let Some(c) = text[..end].chars().next_back() {
+            let url = &text[start..end];
+            let unbalanced = c == ')' && url.matches(')').count() > url.matches('(').count();
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ']' | '\'' | '»') || unbalanced {
+                end -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > start + scheme {
+            out.push((start, end));
+        }
+        i = end.max(start + scheme);
+    }
+    out
+}
+
 /// Lengths of the prefix and suffix all titles share, never cutting a word or number
 /// in two, so `Practice 7` / `Practice 17` share `Practice `, not `Practice `+`7`.
 fn common_affixes(titles: &[Vec<char>]) -> (usize, usize) {
@@ -1301,6 +1339,26 @@ impl App {
         self.clamp();
     }
 
+    /// Opens a link in the default browser; in pocket mode the tracker steps aside.
+    fn open_url(&mut self, url: &str) {
+        let child = std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut c) => {
+                std::thread::spawn(move || c.wait());
+                self.flash(format!("Відкриваю {url}"), false);
+                if self.pocket {
+                    self.hide();
+                }
+            }
+            Err(e) => self.flash(format!("Не вдалося відкрити посилання: {e}"), true),
+        }
+    }
+
     fn toggle_details(&mut self) {
         self.st.hide_details = !self.st.hide_details;
         self.dirty = true;
@@ -1634,6 +1692,7 @@ impl App {
             }
             Click::ToggleCompleted => self.toggle_completed(),
             Click::ToggleDetails => self.toggle_details(),
+            Click::OpenUrl(u) => self.open_url(&u),
             Click::Refresh => self.refresh_now(),
             Click::Login => self.login_requested = true,
             Click::Help => self.mode = Mode::Help,
@@ -1785,6 +1844,14 @@ impl App {
                     KeyCode::Char('d') => self.edit(|list, task| InputKind::Due { list, task }, list, task),
                     KeyCode::Char('m') => self.open_move(list, task),
                     KeyCode::Char('s') => self.toggle_subtasks(&list, &task),
+                    KeyCode::Char('u') => {
+                        let t = self.selected_task();
+                        let text = t.map(|t| format!("{} {}", t.title, t.notes.as_deref().unwrap_or(""))).unwrap_or_default();
+                        match find_urls(&text).first() {
+                            Some(&(a, b)) => self.open_url(&text[a..b].to_string()),
+                            None => self.flash("Посилань немає", false),
+                        }
+                    }
                     KeyCode::Char('v') => {
                         self.toggle_mark(&task);
                         self.move_v(1);
@@ -1844,6 +1911,14 @@ mod tests {
         let order: Vec<&str> =
             app.task_rows("l").iter().map(|&(i, _)| app.list_tasks("l")[i].id.as_str()).collect();
         assert_eq!(order, ["c", "b", "f", "e", "a", "d"]);
+    }
+
+    #[test]
+    fn finds_links() {
+        let urls = |s: &str| find_urls(s).into_iter().map(|(a, b)| s[a..b].to_string()).collect::<Vec<_>>();
+        assert_eq!(urls("див. https://ex.com/a?b=1, і (http://wiki.org/X_(y))."), ["https://ex.com/a?b=1", "http://wiki.org/X_(y)"]);
+        assert_eq!(urls("«https://ex.com»"), ["https://ex.com"]);
+        assert!(urls("https:// nohttp://x.y http").is_empty());
     }
 
     #[test]

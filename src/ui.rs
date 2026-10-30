@@ -1,4 +1,4 @@
-use crate::app::{App, Click, DragItem, Drop, InputKind, Mode, TileRow};
+use crate::app::{find_urls, App, Click, DragItem, Drop, InputKind, Mode, TileRow};
 use crate::date;
 use crate::model::Task;
 use chrono::NaiveDate;
@@ -27,6 +27,8 @@ const DIM: Style = Style::new().fg(OVERLAY);
 const BTN: Style = Style::new().fg(MAUVE).bg(SURFACE0);
 const BTN_HOVER: Style = Style::new().fg(CRUST).bg(MAUVE);
 const SELECTED_BG: Color = SURFACE0;
+const LINK: Style = Style::new().fg(SKY).add_modifier(Modifier::UNDERLINED);
+const LINK_HOVER: Style = Style::new().fg(CRUST).bg(SKY);
 const MARKED_BG: Color = Color::Rgb(0x3e, 0x35, 0x58);
 const MARKED_SEL_BG: Color = Color::Rgb(0x55, 0x48, 0x78);
 /// Narrowest column before the board starts scrolling sideways.
@@ -622,8 +624,45 @@ fn details_toggle(what: &str, folded: bool) -> Seg {
     s
 }
 
+/// Soft-wraps one line into rows `width` wide, keeping words and links whole where
+/// they fit; links become clickable.
+fn link_rows(text: &str, style: Style, width: usize) -> Vec<Seg> {
+    let width = width.max(1);
+    let mut tokens: Vec<(&str, bool)> = Vec::new();
+    let mut at = 0;
+    for (a, b) in find_urls(text) {
+        tokens.extend(text[at..a].split_inclusive(' ').map(|t| (t, false)));
+        tokens.push((&text[a..b], true));
+        at = b;
+    }
+    tokens.extend(text[at..].split_inclusive(' ').map(|t| (t, false)));
+    let mut rows = vec![Seg::default()];
+    for (tok, is_url) in tokens {
+        let mut chars: Vec<char> = tok.chars().collect();
+        while !chars.is_empty() {
+            let row = rows.last_mut().unwrap();
+            let room = width.saturating_sub(row.w as usize);
+            if room == 0 || (chars.len() > room && row.w > 0 && chars.len() <= width) {
+                rows.push(Seg::default());
+                continue;
+            }
+            let n = chars.len().min(room);
+            let piece: String = chars.drain(..n).collect();
+            if is_url {
+                row.click(piece, LINK, Some(LINK_HOVER), Click::OpenUrl(tok.to_string()));
+            } else {
+                row.text(piece, style);
+            }
+        }
+    }
+    rows
+}
+
 fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
+    // Task details are laid out by hand so links can be clicked.
+    let mut rows: Vec<Seg> = Vec::new();
+    let text_w = area.width.saturating_sub(2) as usize;
     let mut btns = Seg::default();
     let mut title = " Опис ";
     if let Some(t) = app.selected_task().cloned() {
@@ -635,7 +674,7 @@ fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
             ("≡ Опис", Click::EditNotes(l.clone(), id.clone())),
             ("⇄ В інший список", Click::MoveTask(l.clone(), id.clone())),
         ]);
-        lines.push(Line::raw(t.title.clone()).bold());
+        rows.extend(link_rows(&t.title, Style::new().bold(), text_w));
         if let Some(d) = t.due_date() {
             let today = date::today();
             let rel = match (d - today).num_days() {
@@ -644,11 +683,13 @@ fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
                 n if n < 0 => format!(" (прострочено на {} дн.)", -n),
                 n => format!(" (через {n} дн.)"),
             };
-            lines.push(Line::from(vec![Span::styled("Дедлайн: ", DIM), Span::raw(date::long(d) + &rel)]));
+            let mut s = Seg::default();
+            s.text("Дедлайн: ", DIM).text(date::long(d) + &rel, Style::new());
+            rows.push(s);
         }
         match &t.notes {
-            Some(n) => lines.extend(n.lines().map(|l| Line::raw(l.to_string()))),
-            None => lines.push(Line::styled("Без опису. Клікніть, щоб додати.", DIM)),
+            Some(n) => rows.extend(n.lines().flat_map(|l| link_rows(l, Style::new(), text_w))),
+            None => rows.extend(link_rows("Без опису. Клікніть, щоб додати.", DIM, text_w)),
         }
         app.hits.push((area, Click::EditNotes(l, id)));
     } else if let Some(l) = app.sel_list().cloned() {
@@ -669,6 +710,10 @@ fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .block(block("", false).style(Style::new().bg(BASE)));
     f.render_widget(p, area);
+    let height = area.height.saturating_sub(2) as usize;
+    for (i, row) in rows.into_iter().take(height).enumerate() {
+        place(f, app, area.x + 1, area.y + 1 + i as u16, text_w as u16, row);
+    }
     let toggle = details_toggle(title.trim(), false);
     let tw = toggle.w;
     place(f, app, area.x + 1, area.y, tw, toggle);
@@ -881,6 +926,7 @@ fn draw_help(f: &mut Frame) {
         ("x  Del", "видалити"),
         ("c / C", "показати виконані / видалити їх"),
         ("I  ▾ ▸", "сховати / показати панель опису"),
+        ("u", "відкрити посилання з опису (або клік)"),
         ("r", "синхронізувати зараз"),
         ("Ctrl+L", "увійти в Google знову"),
         ("q  Esc", "сховати (у кишеню)"),
@@ -1295,6 +1341,22 @@ mod tests {
         let bread = app.list_tasks("a").iter().find(|t| t.title == "Хліб").unwrap();
         assert_eq!(bread.parent.as_deref(), Some(parent.as_str()));
         assert!(app.st.pending.iter().any(|op| matches!(op, Op::DeleteList { list } if list == "c")));
+    }
+
+    #[test]
+    fn links_in_notes_are_clickable() {
+        let mut app = sample();
+        app.st.tasks.get_mut("a").unwrap()[2].notes = Some("Запис: https://meet.example.com/abc-def, о 10:00".into());
+        app.select_task_pub("a", "3");
+        let screen = render(&mut app);
+        assert!(screen.contains("Запис: https://meet.example.com/abc-def, о 10:00"), "{screen}");
+        let url = "https://meet.example.com/abc-def".to_string();
+        let r = hit(&app, Click::OpenUrl(url));
+        assert_eq!(r.width, 32);
+        // Long links wrap but every piece opens the whole link.
+        let rows = link_rows("x https://example.com/a/very/long/path", Style::new(), 12);
+        assert_eq!(rows.len(), 4);
+        assert!(rows[1..].iter().all(|r| matches!(&r.hits[0].2, Click::OpenUrl(u) if u.ends_with("/path"))));
     }
 
     #[test]
